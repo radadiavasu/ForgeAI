@@ -23,3 +23,15 @@ class SelfApprovalError(ForgeAIError):
     """Raised when QA attempts to act on work produced by the same agent id."""
 
     pass
+
+
+class SandboxProvisionError(ForgeAIError):
+    """Raised when the sandbox container cannot be provisioned."""
+
+    pass
+
+
+class SandboxTimeoutError(ForgeAIError):
+    """Raised when sandbox execution exceeds configured timeout."""
+
+    pass
