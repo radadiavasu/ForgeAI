@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from forgeai.agents.backend_agent import BackendAgent
 from forgeai.agents.lead_agent import LeadAgent
 from forgeai.agents.qa_agent import QAAgent
+from forgeai.escalation import EscalationLadder, EscalationLevel, LoopCounter
 from forgeai.exceptions import SelfApprovalError
 from forgeai.models.task import Task, TaskComplexity
 from forgeai.sandbox.runner import TestRunner
@@ -136,3 +137,53 @@ async def test_output_populated_when_done(db_session: AsyncSession) -> None:
     result = await db_session.execute(select(Task).where(Task.id == task.id))
     updated = result.scalar_one()
     assert updated.output == "impl output"
+
+
+@pytest.mark.asyncio
+async def test_failing_tests_trigger_escalation(db_session: AsyncSession) -> None:
+    lead = LeadAgent("lead_agent_1", db_session)
+    backend = BackendAgent("backend_agent_1", db_session)
+    qa = QAAgent("qa_agent_1", db_session, test_runner=TestRunner(_sandbox("HIGH")))
+    ladder = EscalationLadder(loop_counter=LoopCounter(), max_self_retries=2)
+
+    task = await lead.create_task("Escalation task", None, TaskComplexity.HIGH, "backend_agent_1")
+    await lead.approve_phase_transition(task.id)
+    await lead.assign_task(task.id)
+    await backend.complete_work(task.id, output="broken payment impl")
+    await qa.begin_review(task.id)
+    output = await qa.review(
+        task.id,
+        code="def process_payment(amount):\n    return {}\n",
+        test_code=(
+            "from main import process_payment\n\n"
+            "def test_payment_has_status():\n"
+            "    assert process_payment(1).get('status') == 'success'\n"
+        ),
+    )
+    assert output.success is False
+    result = await ladder.escalate(
+        task_id=str(task.id),
+        agent_id=lead.agent_id,
+        error_signature="test_failure:assertion_error",
+        error_detail="assertion failure in payment tests",
+        task_specification="Build Payment API",
+    )
+    assert result.needs_human_input is True
+
+
+@pytest.mark.asyncio
+async def test_escalation_result_logged_correctly(db_session: AsyncSession) -> None:
+    lead = LeadAgent("lead_agent_1", db_session)
+    ladder = EscalationLadder(loop_counter=LoopCounter(), max_self_retries=2)
+    result = await ladder.escalate(
+        task_id="log-task",
+        agent_id=lead.agent_id,
+        error_signature="sandbox_timeout",
+        error_detail="sandbox timed out",
+        task_specification="Build resilient timeout handling",
+    )
+
+    events = ladder.get_events("log-task")
+    assert result.level_reached == EscalationLevel.HUMAN_INPUT
+    assert len(events) >= 5
+    assert events[-1].level == EscalationLevel.HUMAN_INPUT

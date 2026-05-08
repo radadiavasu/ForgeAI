@@ -1,8 +1,13 @@
 """Application settings loaded from environment variables."""
 
 from functools import lru_cache
+import logging
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
 
 
 class Settings(BaseSettings):
@@ -22,6 +27,8 @@ class Settings(BaseSettings):
     sandbox_timeout_medium: int = 180
     sandbox_timeout_high: int = 600
     sandbox_working_dir: str = "/sandbox"
+    drift_threshold: int = 40
+    max_self_retries: int = 2
 
 
 @lru_cache
