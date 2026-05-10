@@ -3,6 +3,7 @@
 from functools import lru_cache
 import logging
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -38,6 +39,32 @@ class Settings(BaseSettings):
     minio_bucket: str = "forgeai-checkpoints"
     minio_secure: bool = False
     task_memory_ttl: int = 86400
+
+    anthropic_api_key: str = ""
+    pool_low_default: str = Field(
+        default="claude-haiku-4-5-20251001",
+        validation_alias="MODEL_LOW_DEFAULT",
+    )
+    pool_low_escalated: str = Field(
+        default="claude-sonnet-4-6",
+        validation_alias="MODEL_LOW_ESCALATED",
+    )
+    pool_medium_default: str = Field(
+        default="claude-sonnet-4-6",
+        validation_alias="MODEL_MEDIUM_DEFAULT",
+    )
+    pool_medium_escalated: str = Field(
+        default="claude-sonnet-4-6",
+        validation_alias="MODEL_MEDIUM_ESCALATED",
+    )
+    pool_high_default: str = Field(
+        default="claude-sonnet-4-6",
+        validation_alias="MODEL_HIGH_DEFAULT",
+    )
+    pool_high_escalated: str = Field(
+        default="claude-opus-4-6",
+        validation_alias="MODEL_HIGH_ESCALATED",
+    )
 
 
 @lru_cache

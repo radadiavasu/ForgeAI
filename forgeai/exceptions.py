@@ -47,3 +47,9 @@ class CheckpointNotFoundError(ForgeAIError):
     """Raised when a checkpoint object does not exist in object storage."""
 
     pass
+
+
+class LLMRateLimitError(ForgeAIError):
+    """Raised when the Anthropic API rate-limits after retries are exhausted."""
+
+    pass

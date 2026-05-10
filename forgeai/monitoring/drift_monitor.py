@@ -18,7 +18,7 @@ class DriftMonitor:
 
     def compute_drift_score(self, task_specification: str, agent_output: str) -> int:
         """Compute integer semantic drift score in [0, 100]."""
-        # SWAP_POINT: replace with Anthropic embeddings API from Phase 5
+        # EMBEDDING: sentence-transformers via embeddings.compute_similarity
         similarity = embeddings.compute_similarity(task_specification, agent_output)
         score = int((1 - similarity) * 100)
         bounded_score = max(0, min(100, score))

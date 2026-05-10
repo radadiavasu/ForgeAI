@@ -1,8 +1,14 @@
-"""Lead agent stub: task creation and early lifecycle transitions."""
+"""Lead agent: task creation, lifecycle transitions, project artefacts."""
+
+from __future__ import annotations
 
 import uuid
 
+from sqlalchemy import func as sa_func, select, update
+
 from forgeai.agents.base import BaseAgent
+from forgeai.llm.schemas import MasterDocument, TechStackDocument
+from forgeai.models.project_artefact import ProjectArtefactModel
 from forgeai.models.task import Task, TaskComplexity
 from forgeai.state_machine.machine import TaskStateMachine
 from forgeai.state_machine.states import TaskState
@@ -89,3 +95,66 @@ class LeadAgent(BaseAgent):
             TaskState.IN_PROGRESS,
             self.agent_id,
         )
+
+    async def persist_versioned_artefact(
+        self,
+        project_id: uuid.UUID,
+        artefact_type: str,
+        content: dict,
+        created_by: str,
+    ) -> uuid.UUID:
+        """Insert a new artefact version; previous same-type rows marked not current."""
+        max_ver = (
+            await self.db.execute(
+                select(sa_func.max(ProjectArtefactModel.version)).where(
+                    ProjectArtefactModel.project_id == project_id,
+                    ProjectArtefactModel.artefact_type == artefact_type,
+                )
+            )
+        ).scalar_one_or_none()
+        next_version = int(max_ver or 0) + 1
+
+        await self.db.execute(
+            update(ProjectArtefactModel)
+            .where(
+                ProjectArtefactModel.project_id == project_id,
+                ProjectArtefactModel.artefact_type == artefact_type,
+                ProjectArtefactModel.is_current.is_(True),
+            )
+            .values(is_current=False)
+        )
+
+        row = ProjectArtefactModel(
+            project_id=project_id,
+            artefact_type=artefact_type,
+            content=content,
+            version=next_version,
+            is_current=True,
+            created_by=created_by,
+        )
+        self.db.add(row)
+        await self.db.commit()
+        await self.db.refresh(row)
+        return row.id
+
+    async def persist_master_and_tech_stack_documents(
+        self,
+        project_id: uuid.UUID,
+        master_document: MasterDocument,
+        tech_stack_document: TechStackDocument,
+        created_by: str,
+    ) -> tuple[uuid.UUID, uuid.UUID]:
+        """Save Master_Document and Tech_Stack_Document as versioned JSONB rows."""
+        mid = await self.persist_versioned_artefact(
+            project_id,
+            "master_document",
+            master_document.model_dump(mode="json"),
+            created_by,
+        )
+        tid = await self.persist_versioned_artefact(
+            project_id,
+            "tech_stack_document",
+            tech_stack_document.model_dump(mode="json"),
+            created_by,
+        )
+        return mid, tid

@@ -1,8 +1,7 @@
 """Embedding helper functions for semantic similarity."""
 
-# SWAP_POINT: This entire module will be replaced with Anthropic
-# embeddings API calls from Phase 5 onward.
-# Search for SWAP_POINT across the codebase when Phase 5 begins.
+# EMBEDDING: using sentence-transformers/all-MiniLM-L6-v2
+# Future: replace with dedicated embedding model when available
 
 from __future__ import annotations
 
@@ -30,7 +29,7 @@ def compute_similarity(text_a: str, text_b: str) -> float:
     if not clean_a or not clean_b:
         return 0.0
 
-    # SWAP_POINT: replace internals with Anthropic embeddings API
+    # EMBEDDING: sentence-transformers (see module header)
     try:
         model = get_model()
         vec_a, vec_b = model.encode([clean_a, clean_b])

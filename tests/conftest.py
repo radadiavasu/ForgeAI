@@ -1,6 +1,7 @@
 """Pytest fixtures: async DB session, schema reset, and sample tasks."""
 
 import forgeai.models.escalation  # noqa: F401 — register metadata for create_all
+import forgeai.models.project_artefact  # noqa: F401
 
 import fakeredis.aioredis
 import pytest

@@ -12,6 +12,7 @@ from forgeai.config import get_settings
 from forgeai.models.task import Base
 
 import forgeai.models.escalation  # noqa: F401
+import forgeai.models.project_artefact  # noqa: F401
 
 config = context.config
 if config.config_file_name is not None:

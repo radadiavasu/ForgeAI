@@ -3,6 +3,7 @@
 import uuid
 
 from forgeai.agents.base import BaseAgent
+from forgeai.llm.client import LLMClient
 from forgeai.memory.task_memory import TaskMemory
 from forgeai.exceptions import SelfApprovalError
 from forgeai.models.task import Task
@@ -11,6 +12,12 @@ from forgeai.sandbox.schemas import RunnerOutput
 from forgeai.state_machine.machine import TaskStateMachine
 from forgeai.state_machine.states import TaskState
 from forgeai.state_machine.transitions import KEY_DEFECT_REPORT, KEY_OUTPUT, KEY_WORK_OUTPUT
+
+QA_DEFECT_ANALYSIS_PROMPT = """
+You are QA_Agent. Given a task description and pytest/sandbox output, write a concise
+defect report for the developer: bullet points for each failure, likely root cause,
+and concrete fix hints. Output plain text only.
+""".strip()
 
 
 class QAAgent(BaseAgent):
@@ -23,9 +30,11 @@ class QAAgent(BaseAgent):
         test_runner: TestRunner | None = None,
         *,
         task_memory: TaskMemory | None = None,
+        llm_client: LLMClient | None = None,
     ) -> None:
         super().__init__(agent_id, db_session, task_memory=task_memory)
         self.test_runner = test_runner
+        self.llm = llm_client
 
     async def begin_review(self, task_id: uuid.UUID) -> Task:
         """Transition ``IN_REVIEW`` → ``TESTING``."""
@@ -42,6 +51,29 @@ class QAAgent(BaseAgent):
         if self.test_runner is None:
             raise RuntimeError("QAAgent requires a TestRunner for review()")
         return await self.test_runner.run(code=code, test_code=test_code)
+
+    async def analyze_defects(self, task_specification: str, runner_output: RunnerOutput) -> str:
+        """Optional LLM-assisted defect narrative from sandbox results."""
+        if self.llm is None:
+            return (
+                runner_output.sandbox_error.strip()
+                or runner_output.stderr.strip()
+                or "Tests failed"
+            )
+        detail = (
+            f"Task:\n{task_specification}\n\n"
+            f"success={runner_output.success} timed_out={runner_output.timed_out}\n"
+            f"stdout:\n{runner_output.stdout}\n\nstderr:\n{runner_output.stderr}\n\n"
+            f"sandbox_error:\n{runner_output.sandbox_error}"
+        )
+        resp = await self.llm.complete(
+            system_prompt=QA_DEFECT_ANALYSIS_PROMPT,
+            user_message=detail,
+            complexity="LOW",
+            loop_count=0,
+            max_tokens=2048,
+        )
+        return resp.content.strip()
 
     async def approve(self, task_id: uuid.UUID, output: str | None = None) -> Task:
         """Transition ``TESTING`` → ``DONE`` with provided or stored output."""
