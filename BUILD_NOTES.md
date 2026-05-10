@@ -4,7 +4,7 @@ Create a file called BUILD_NOTES.md in the project root with this exact content:
 # Decisions made during build that extend or differ from the requirements document.
 # Updated after every phase. Referenced before every new phase prompt.
 
----
+------
 
 ## Phase 5 Discoveries
 
