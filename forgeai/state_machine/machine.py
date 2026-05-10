@@ -15,6 +15,7 @@ from forgeai.exceptions import (
     InvalidTransitionError,
     TransitionConditionError,
 )
+from forgeai.memory.task_memory import TaskMemory
 from forgeai.models.task import Task, TaskStateHistory
 from forgeai.state_machine.states import TaskState
 from forgeai.state_machine.transitions import (
@@ -34,13 +35,19 @@ logger = logging.getLogger(__name__)
 class TaskStateMachine:
     """Applies allowed transitions, persists audit rows, and updates tasks."""
 
-    def __init__(self, session: AsyncSession) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        task_memory: TaskMemory | None = None,
+    ) -> None:
         """Attach an async session used for all operations.
 
         Args:
             session: Active SQLAlchemy async session.
+            task_memory: Optional Redis task memory; defaults from settings when omitted.
         """
         self._session = session
+        self._task_memory = task_memory
 
     async def transition(
         self,
@@ -164,6 +171,11 @@ class TaskStateMachine:
 
         await self._session.commit()
         await self._session.refresh(task)
+
+        if to_state == TaskState.DONE:
+            tm = self._task_memory if self._task_memory is not None else TaskMemory.from_settings()
+            await tm.delete_all(str(task_id))
+
         return task
 
     async def get_history(self, task_id: UUID) -> list[TaskStateHistory]:

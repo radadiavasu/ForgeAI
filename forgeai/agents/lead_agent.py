@@ -62,7 +62,7 @@ class LeadAgent(BaseAgent):
             forgeai.exceptions.InvalidTransitionError: If the edge is invalid.
             forgeai.exceptions.TransitionConditionError: If approval is missing.
         """
-        machine = TaskStateMachine(self.db)
+        machine = TaskStateMachine(self.db, task_memory=self.task_memory)
         return await machine.transition(
             task_id,
             TaskState.TODO,
@@ -83,7 +83,7 @@ class LeadAgent(BaseAgent):
             forgeai.exceptions.InvalidTransitionError: If the edge is invalid.
             forgeai.exceptions.TransitionConditionError: On condition failures.
         """
-        machine = TaskStateMachine(self.db)
+        machine = TaskStateMachine(self.db, task_memory=self.task_memory)
         return await machine.transition(
             task_id,
             TaskState.IN_PROGRESS,

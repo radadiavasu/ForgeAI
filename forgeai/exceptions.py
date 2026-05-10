@@ -41,3 +41,9 @@ class AlreadyEscalatedError(ForgeAIError):
     """Raised when a level-5 task is retried without new human input."""
 
     pass
+
+
+class CheckpointNotFoundError(ForgeAIError):
+    """Raised when a checkpoint object does not exist in object storage."""
+
+    pass

@@ -3,6 +3,7 @@
 import uuid
 
 from forgeai.agents.base import BaseAgent
+from forgeai.memory.task_memory import TaskMemory
 from forgeai.exceptions import SelfApprovalError
 from forgeai.models.task import Task
 from forgeai.sandbox.runner import TestRunner
@@ -16,14 +17,19 @@ class QAAgent(BaseAgent):
     """Runs testing transitions, sandbox review, and self-approval checks."""
 
     def __init__(
-        self, agent_id: str, db_session, test_runner: TestRunner | None = None
+        self,
+        agent_id: str,
+        db_session,
+        test_runner: TestRunner | None = None,
+        *,
+        task_memory: TaskMemory | None = None,
     ) -> None:
-        super().__init__(agent_id, db_session)
+        super().__init__(agent_id, db_session, task_memory=task_memory)
         self.test_runner = test_runner
 
     async def begin_review(self, task_id: uuid.UUID) -> Task:
         """Transition ``IN_REVIEW`` → ``TESTING``."""
-        machine = TaskStateMachine(self.db)
+        machine = TaskStateMachine(self.db, task_memory=self.task_memory)
         return await machine.transition(
             task_id,
             TaskState.TESTING,
@@ -43,7 +49,7 @@ class QAAgent(BaseAgent):
         final_output = output.strip() if isinstance(output, str) and output.strip() else ""
         if not final_output:
             final_output = await self._get_work_output(task_id)
-        machine = TaskStateMachine(self.db)
+        machine = TaskStateMachine(self.db, task_memory=self.task_memory)
         return await machine.transition(
             task_id,
             TaskState.DONE,
@@ -67,7 +73,7 @@ class QAAgent(BaseAgent):
             forgeai.exceptions.TransitionConditionError: If defect report invalid.
         """
         await self._assert_not_self_approval(task_id)
-        machine = TaskStateMachine(self.db)
+        machine = TaskStateMachine(self.db, task_memory=self.task_memory)
         return await machine.transition(
             task_id,
             TaskState.IN_PROGRESS,
@@ -87,7 +93,7 @@ class QAAgent(BaseAgent):
         Raises:
             RuntimeError: If no prior work output row exists.
         """
-        machine = TaskStateMachine(self.db)
+        machine = TaskStateMachine(self.db, task_memory=self.task_memory)
         hist = await machine.get_history(task_id)
         for row in reversed(hist):
             if (
@@ -110,7 +116,7 @@ class QAAgent(BaseAgent):
         Raises:
             SelfApprovalError: If implementer id equals this QA ``agent_id``.
         """
-        machine = TaskStateMachine(self.db)
+        machine = TaskStateMachine(self.db, task_memory=self.task_memory)
         hist = await machine.get_history(task_id)
         for row in reversed(hist):
             if (

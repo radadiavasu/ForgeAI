@@ -1,5 +1,8 @@
 """Pytest fixtures: async DB session, schema reset, and sample tasks."""
 
+import forgeai.models.escalation  # noqa: F401 — register metadata for create_all
+
+import fakeredis.aioredis
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,6 +13,17 @@ from forgeai.agents.qa_agent import QAAgent
 from forgeai.database import AsyncSessionFactory, engine
 from forgeai.models.task import Base, Task, TaskComplexity
 from forgeai.state_machine.states import TaskState
+
+
+@pytest.fixture(autouse=True)
+def _shared_fake_redis(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Use in-memory Redis so LoopCounter and TaskMemory tests need no daemon."""
+    fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
+
+    def _from_url(*_args, **_kwargs):  # noqa: ANN002
+        return fake
+
+    monkeypatch.setattr("redis.asyncio.from_url", _from_url)
 
 
 @pytest_asyncio.fixture(autouse=True)

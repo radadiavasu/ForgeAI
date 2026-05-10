@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import UTC, datetime
 
 from forgeai.escalation.loop_counter import LoopCounter
+from forgeai.escalation.persistence import EscalationPersistence
 from forgeai.escalation.schemas import EscalationEvent, EscalationLevel, EscalationResult
 from forgeai.exceptions import AlreadyEscalatedError
 
@@ -15,12 +17,16 @@ logger = logging.getLogger(__name__)
 class EscalationLadder:
     """Failure escalation flow from self-retry to human intervention."""
 
-    def __init__(self, loop_counter: LoopCounter, max_self_retries: int = 2) -> None:
+    def __init__(
+        self,
+        loop_counter: LoopCounter,
+        persistence: EscalationPersistence,
+        max_self_retries: int = 2,
+    ) -> None:
         self.loop_counter = loop_counter
+        self._persistence = persistence
         self.max_self_retries = max_self_retries
-        self._events: list[EscalationEvent] = []
         self._self_retry_attempts: dict[str, int] = {}
-        # Phase 4 will persist events to PostgreSQL.
 
     async def escalate(
         self,
@@ -31,12 +37,12 @@ class EscalationLadder:
         task_specification: str,
     ) -> EscalationResult:
         """Run the escalation decision tree and return the final result."""
-        if self.get_current_level(task_id) == EscalationLevel.HUMAN_INPUT:
+        if await self.get_current_level(task_id) == EscalationLevel.HUMAN_INPUT:
             raise AlreadyEscalatedError(
                 f"Task {task_id} already reached level 5 and requires human input"
             )
 
-        loop_count = self.loop_counter.increment(task_id, error_signature)
+        loop_count = await self.loop_counter.increment(task_id, error_signature)
         start_level = EscalationLevel.PEER_ASSIST if loop_count >= 3 else EscalationLevel.SELF_RETRY
 
         if start_level == EscalationLevel.PEER_ASSIST:
@@ -49,7 +55,7 @@ class EscalationLadder:
 
         if start_level == EscalationLevel.SELF_RETRY:
             resolved = await self._level_1_self_retry(task_id=task_id, agent_id=agent_id)
-            self._record_event(
+            await self._record_event(
                 task_id=task_id,
                 agent_id=agent_id,
                 level=EscalationLevel.SELF_RETRY,
@@ -70,7 +76,7 @@ class EscalationLadder:
                 )
 
         level2 = await self._level_2_peer_assist(task_id=task_id, agent_id=agent_id)
-        self._record_event(
+        await self._record_event(
             task_id=task_id,
             agent_id=agent_id,
             level=EscalationLevel.PEER_ASSIST,
@@ -91,7 +97,7 @@ class EscalationLadder:
         level3 = await self._level_3_architect_review(
             task_id=task_id, task_specification=task_specification
         )
-        self._record_event(
+        await self._record_event(
             task_id=task_id,
             agent_id=agent_id,
             level=EscalationLevel.ARCHITECT_REVIEW,
@@ -112,7 +118,7 @@ class EscalationLadder:
         level4 = await self._level_4_task_rewrite(
             task_id=task_id, task_specification=task_specification
         )
-        self._record_event(
+        await self._record_event(
             task_id=task_id,
             agent_id=agent_id,
             level=EscalationLevel.TASK_REWRITE,
@@ -131,7 +137,7 @@ class EscalationLadder:
             )
 
         result = await self._level_5_human_input(task_id=task_id, error_detail=error_detail)
-        self._record_event(
+        await self._record_event(
             task_id=task_id,
             agent_id=agent_id,
             level=EscalationLevel.HUMAN_INPUT,
@@ -140,6 +146,8 @@ class EscalationLadder:
             loop_count=loop_count,
             resolved=False,
             resolution="Task requires human guidance",
+            needs_human_input=True,
+            human_message=result.human_message,
         )
         return result
 
@@ -211,21 +219,18 @@ class EscalationLadder:
             ),
         )
 
-    def get_events(self, task_id: str) -> list[EscalationEvent]:
+    async def get_events(self, task_id: str) -> list[EscalationEvent]:
         """Return all escalation events for a task ordered by timestamp."""
-        return sorted(
-            [event for event in self._events if event.task_id == task_id],
-            key=lambda item: item.timestamp,
-        )
+        return await self._persistence.get_events(task_id)
 
-    def get_current_level(self, task_id: str) -> EscalationLevel | None:
+    async def get_current_level(self, task_id: str) -> EscalationLevel | None:
         """Return highest escalation level reached for task, or None."""
-        task_events = self.get_events(task_id)
+        task_events = await self.get_events(task_id)
         if not task_events:
             return None
         return max(event.level for event in task_events)
 
-    def _record_event(
+    async def _record_event(
         self,
         *,
         task_id: str,
@@ -236,8 +241,11 @@ class EscalationLadder:
         loop_count: int,
         resolved: bool,
         resolution: str,
+        needs_human_input: bool = False,
+        human_message: str = "",
     ) -> None:
         event = EscalationEvent(
+            id=str(uuid.uuid4()),
             task_id=task_id,
             agent_id=agent_id,
             level=level,
@@ -247,8 +255,11 @@ class EscalationLadder:
             timestamp=datetime.now(UTC),
             resolved=resolved,
             resolution=resolution,
+            needs_human_input=needs_human_input,
+            human_message=human_message,
         )
-        self._events.append(event)
+        await self._persistence.save_event(event)
+        await self._persistence.db.commit()
         logger.warning(
             "Escalation event: task_id=%s level=%d outcome=%s timestamp=%s",
             task_id,

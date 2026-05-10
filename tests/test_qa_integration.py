@@ -10,7 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from forgeai.agents.backend_agent import BackendAgent
 from forgeai.agents.lead_agent import LeadAgent
 from forgeai.agents.qa_agent import QAAgent
-from forgeai.escalation import EscalationLadder, EscalationLevel, LoopCounter
+from forgeai.escalation import (
+    EscalationLadder,
+    EscalationLevel,
+    EscalationPersistence,
+    LoopCounter,
+)
 from forgeai.exceptions import SelfApprovalError
 from forgeai.models.task import Task, TaskComplexity
 from forgeai.sandbox.runner import TestRunner
@@ -144,7 +149,11 @@ async def test_failing_tests_trigger_escalation(db_session: AsyncSession) -> Non
     lead = LeadAgent("lead_agent_1", db_session)
     backend = BackendAgent("backend_agent_1", db_session)
     qa = QAAgent("qa_agent_1", db_session, test_runner=TestRunner(_sandbox("HIGH")))
-    ladder = EscalationLadder(loop_counter=LoopCounter(), max_self_retries=2)
+    ladder = EscalationLadder(
+        loop_counter=LoopCounter(),
+        persistence=EscalationPersistence(db_session),
+        max_self_retries=2,
+    )
 
     task = await lead.create_task("Escalation task", None, TaskComplexity.HIGH, "backend_agent_1")
     await lead.approve_phase_transition(task.id)
@@ -174,16 +183,21 @@ async def test_failing_tests_trigger_escalation(db_session: AsyncSession) -> Non
 @pytest.mark.asyncio
 async def test_escalation_result_logged_correctly(db_session: AsyncSession) -> None:
     lead = LeadAgent("lead_agent_1", db_session)
-    ladder = EscalationLadder(loop_counter=LoopCounter(), max_self_retries=2)
+    ladder = EscalationLadder(
+        loop_counter=LoopCounter(),
+        persistence=EscalationPersistence(db_session),
+        max_self_retries=2,
+    )
+    log_task_id = "11111111-1111-1111-1111-222222222222"
     result = await ladder.escalate(
-        task_id="log-task",
+        task_id=log_task_id,
         agent_id=lead.agent_id,
         error_signature="sandbox_timeout",
         error_detail="sandbox timed out",
         task_specification="Build resilient timeout handling",
     )
 
-    events = ladder.get_events("log-task")
+    events = await ladder.get_events(log_task_id)
     assert result.level_reached == EscalationLevel.HUMAN_INPUT
     assert len(events) >= 5
     assert events[-1].level == EscalationLevel.HUMAN_INPUT

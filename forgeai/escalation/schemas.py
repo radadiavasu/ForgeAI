@@ -21,6 +21,7 @@ class EscalationLevel(IntEnum):
 class EscalationEvent(BaseModel):
     """Single escalation attempt record."""
 
+    id: str = ""
     task_id: str
     agent_id: str
     level: EscalationLevel
@@ -30,6 +31,8 @@ class EscalationEvent(BaseModel):
     timestamp: datetime
     resolved: bool = False
     resolution: str = ""
+    needs_human_input: bool = False
+    human_message: str = ""
 
 
 class EscalationResult(BaseModel):

@@ -8,3 +8,7 @@ pytest==8.3.4
 pytest-asyncio==0.25.0
 docker
 sentence-transformers
+redis>=5.0.0
+chromadb>=0.5.0
+minio>=7.2.0
+fakeredis>=2.23.0

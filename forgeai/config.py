@@ -29,6 +29,15 @@ class Settings(BaseSettings):
     sandbox_working_dir: str = "/sandbox"
     drift_threshold: int = 40
     max_self_retries: int = 2
+    redis_url: str = "redis://localhost:6379"
+    chroma_host: str = "localhost"
+    chroma_port: int = 8000
+    minio_endpoint: str = "localhost:9000"
+    minio_access_key: str = "forgeai"
+    minio_secret_key: str = "forgeai_dev"
+    minio_bucket: str = "forgeai-checkpoints"
+    minio_secure: bool = False
+    task_memory_ttl: int = 86400
 
 
 @lru_cache
