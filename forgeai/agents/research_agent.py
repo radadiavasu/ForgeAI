@@ -181,8 +181,8 @@ class ResearchAgent(BaseAgent):
         self,
         agent_id: str,
         db_session,
-        llm_client: LLMClient,
-        agent_memory: AgentMemory,
+        llm_client: LLMClient | None = None,
+        agent_memory: AgentMemory | None = None,
     ) -> None:
         super().__init__(agent_id, db_session)
         self.llm = llm_client
@@ -191,6 +191,8 @@ class ResearchAgent(BaseAgent):
 
     async def research(self, project_brief: str, preflight_constraints: dict) -> ResearchOutput:
         """Run research with lessons from memory and web search enabled."""
+        if self.llm is None or self.memory is None:
+            raise RuntimeError("ResearchAgent requires llm_client and agent_memory")
         query = f"{project_brief}\nConstraints: {preflight_constraints!s}"
         ranked = await self.memory.retrieve_lessons(self.agent_role, query, top_k=5)
         lesson_lines = [f"- {x.lesson.rule}" for x in ranked[:5]]

@@ -79,6 +79,11 @@ class Task(Base):
         onupdate=func.now(),
     )
     output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    dependency_titles: Mapped[list[str] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        default=None,
+    )
 
     history: Mapped[list["TaskStateHistory"]] = relationship(
         "TaskStateHistory",

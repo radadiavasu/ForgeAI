@@ -114,8 +114,8 @@ class ArchitectAgent(BaseAgent):
         self,
         agent_id: str,
         db_session,
-        llm_client: LLMClient,
-        agent_memory: AgentMemory,
+        llm_client: LLMClient | None = None,
+        agent_memory: AgentMemory | None = None,
     ) -> None:
         super().__init__(agent_id, db_session)
         self.llm = llm_client
@@ -129,6 +129,8 @@ class ArchitectAgent(BaseAgent):
         preflight_constraints: dict,
     ) -> MasterDocument:
         """Build MasterDocument from brief, research, and constraints."""
+        if self.llm is None or self.memory is None:
+            raise RuntimeError("ArchitectAgent requires llm_client and agent_memory")
         query = f"{project_brief}\n{research_output.domain_summary}"
         ranked = await self.memory.retrieve_lessons(self.agent_role, query, top_k=5)
         lesson_lines = [f"- {x.lesson.rule}" for x in ranked[:5]]
@@ -200,6 +202,8 @@ class ArchitectAgent(BaseAgent):
 
     async def produce_tech_stack_document(self, research_output: ResearchOutput) -> TechStackDocument:
         """Formal tech stack document from research (MEDIUM complexity)."""
+        if self.llm is None:
+            raise RuntimeError("ArchitectAgent requires llm_client")
         user_message = (
             "Research output JSON:\n"
             f"{research_output.model_dump_json()}\n"
@@ -230,3 +234,55 @@ class ArchitectAgent(BaseAgent):
                 raise
         assert last_err is not None
         raise last_err
+
+    async def generate_layout_spec(self, master_doc: MasterDocument, project_id: str) -> LayoutSpecification:
+        """Path B — derive ``LayoutSpecification`` from ``Master_Document`` (Req 22)."""
+        from forgeai.contracts.schemas import LayoutSpecification
+
+        if self.llm is None:
+            raise RuntimeError("ArchitectAgent requires llm_client")
+        user_message = (
+            "From this Master_Document, emit LayoutSpecification JSON with keys: "
+            "project_id, source, pages (name, route, sections, interactions, acceptance_criteria), "
+            "shared_components (name, used_by_pages, props, description), design_tokens.\n"
+            f"project_id must be {json.dumps(project_id)}. source must be architect_generated.\n\n"
+            f"{master_doc.model_dump_json()}"
+        )
+        resp = await self.llm.complete(
+            system_prompt="You are Architect_Agent. Output JSON only for LayoutSpecification.",
+            user_message=user_message,
+            complexity="MEDIUM",
+            loop_count=0,
+            max_tokens=8192,
+        )
+        raw = _extract_json_object(resp.content)
+        raw.setdefault("project_id", project_id)
+        raw["source"] = str(raw.get("source") or "architect_generated")
+        return LayoutSpecification.model_validate(raw)
+
+    async def process_mockup_layout(self, mockup_file_path: str, project_id: str) -> LayoutSpecification:
+        """Path A — mockup file metadata → ``LayoutSpecification`` (Req 22)."""
+        from pathlib import Path
+
+        from forgeai.contracts.schemas import LayoutSpecification
+
+        path = Path(mockup_file_path)
+        size = path.stat().st_size
+        if self.llm is None:
+            raise RuntimeError("ArchitectAgent requires llm_client")
+        user_message = (
+            f"Mockup path={mockup_file_path} size_bytes={size} project_id={project_id}. "
+            "Infer LayoutSpecification JSON (pages, shared_components, design_tokens). "
+            'Set "source" to "mockup".'
+        )
+        resp = await self.llm.complete(
+            system_prompt="You are Architect_Agent. Output LayoutSpecification JSON only.",
+            user_message=user_message,
+            complexity="MEDIUM",
+            loop_count=0,
+            max_tokens=8192,
+        )
+        raw = _extract_json_object(resp.content)
+        raw.setdefault("project_id", project_id)
+        raw["source"] = str(raw.get("source") or "mockup")
+        return LayoutSpecification.model_validate(raw)

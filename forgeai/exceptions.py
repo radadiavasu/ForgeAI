@@ -53,3 +53,15 @@ class LLMRateLimitError(ForgeAIError):
     """Raised when the Anthropic API rate-limits after retries are exhausted."""
 
     pass
+
+
+class DuplicateComponentError(ForgeAIError):
+    """Raised when registering a component name that already exists for the project."""
+
+    pass
+
+
+class BootstrapError(ForgeAIError):
+    """Raised when the agent bootstrap protocol cannot complete."""
+
+    pass

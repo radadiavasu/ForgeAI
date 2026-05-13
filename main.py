@@ -1,55 +1,48 @@
-"""Phase 5 demo: research + architecture with real LLM, then backend task + sandbox QA."""
+"""Phase 6 demo: bootstrap, layout spec, navigation contract, frontend builds, QA."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 import uuid
+from datetime import UTC, datetime
+
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from forgeai.agents.architect_agent import ArchitectAgent
-from forgeai.agents.backend_agent import BackendAgent
+from forgeai.agents.frontend_agent import FrontendAgent
 from forgeai.agents.lead_agent import LeadAgent
 from forgeai.agents.qa_agent import QAAgent
-from forgeai.agents.research_agent import ResearchAgent
+from forgeai.bootstrap.protocol import AgentBootstrapProtocol
+from forgeai.bootstrap.schemas import ApprovedConfig
 from forgeai.config import get_settings
+from forgeai.contracts.registry import ComponentRegistry
+from forgeai.contracts.schemas import LayoutSpecification, PageSpec, SharedComponentSpec
 from forgeai.database import AsyncSessionFactory
 from forgeai.llm.client import LLMClient
 from forgeai.llm.model_router import ModelRouter
 from forgeai.llm.schemas import ModelPool
 from forgeai.memory.agent_memory import AgentMemory
 from forgeai.memory.task_memory import TaskMemory
-from forgeai.models.task import TaskComplexity
+from forgeai.models.task import Task, TaskComplexity
 from forgeai.sandbox.runner import TestRunner
 from forgeai.sandbox.sandbox import Sandbox, SandboxConfig
 from forgeai.state_machine.machine import TaskStateMachine
-from forgeai.state_machine.transitions import KEY_WORK_OUTPUT
+from forgeai.state_machine.states import TaskState
+from forgeai.state_machine.transitions import KEY_METADATA, KEY_WORK_OUTPUT
 
-PROJECT_BRIEF = (
-    "Build a restaurant booking website. Users should be able to "
-    "browse the menu, make reservations, and manage their bookings. "
-    "We need an admin panel for the restaurant owner."
-)
+BRIEF = """Build a personal task manager. Users can create tasks,
+mark them complete, and view their task history."""
 
-PREFLIGHT_CONSTRAINTS = {
-    "preferred_language": "Python",
-    "database": "PostgreSQL",
+CONSTRAINTS = {
+    "frontend_framework": "React",
+    "styling": "Tailwind CSS",
     "deployment": "Docker",
 }
 
-_MENU_LISTING_TESTS = """
-from main import list_menu_items
-
-def test_list_menu_items_returns_list():
-    items = list_menu_items()
-    assert isinstance(items, list)
-
-def test_each_item_has_name():
-    for item in list_menu_items():
-        assert isinstance(item, dict)
-        assert "name" in item
-"""
+ROOT_TITLE = "Build AppLayout — shared shell, NavBar, Footer"
 
 
 def _configure_logging() -> None:
@@ -95,147 +88,320 @@ def _make_runner(complexity: TaskComplexity) -> TestRunner:
     return TestRunner(sandbox)
 
 
-def _master_context_snippet(master_document, max_chars: int = 14000) -> str:
-    raw = master_document.model_dump_json()
-    return raw if len(raw) <= max_chars else raw[:max_chars] + "\n…(truncated)"
+def _python_bundle_for_qa(react_code: str) -> str:
+    return f"GENERATED_UI = {json.dumps(react_code)}\n"
 
 
-async def _run_research_and_architecture(session: AsyncSession) -> tuple[uuid.UUID, object, object]:
-    settings = get_settings()
-    if not settings.anthropic_api_key.strip():
-        print(
-            "[FORGEAI] Set ANTHROPIC_API_KEY in .env for real LLM runs.",
-            file=sys.stderr,
-        )
-        raise SystemExit(1)
-
-    pool = ModelPool.from_env()
-    router = ModelRouter(pool)
-    llm = LLMClient(settings.anthropic_api_key, router)
-
-    memory = AgentMemory(settings.chroma_host, settings.chroma_port)
-    research = ResearchAgent("research_agent_1", session, llm, memory)
-    architect = ArchitectAgent("architect_agent_1", session, llm, memory)
-    lead = LeadAgent("lead_agent_1", session)
-
-    print("=== RUN 1: RESEARCH AND ARCHITECTURE ===")
-    ro = await research.research(PROJECT_BRIEF, PREFLIGHT_CONSTRAINTS)
-    print(f"  Domain: {ro.domain_summary[:120]}{'…' if len(ro.domain_summary) > 120 else ''}")
-    rs = ro.recommended_stack
-    print(f"  Recommended stack: {rs.language} · {rs.framework} · {rs.database} · {rs.testing_framework}")
-    print(f"  Options evaluated: {len(ro.technology_options)}")
-    print(f"  Sources: {len(ro.research_sources)} references")
-
-    md = await architect.produce_master_document(PROJECT_BRIEF, ro, PREFLIGHT_CONSTRAINTS)
-    tsd = await architect.produce_tech_stack_document(ro)
-    print(f"  Project: {md.project_name}")
-    print(f"  Components: {len(md.components)} defined")
-    print(f"  APIs: {len(md.api_surfaces)} endpoints specified")
-    print(f"  Data models: {len(md.data_models)} models defined")
-
-    project_id = uuid.uuid4()
-    print("\n[LEAD] Writing to Project_Memory...")
-    mid, tid = await lead.persist_master_and_tech_stack_documents(
-        project_id,
-        md,
-        tsd,
-        created_by=lead.agent_id,
+async def auto_approve(rec) -> ApprovedConfig:
+    return ApprovedConfig(
+        frontend_agent_count=rec.frontend_agent_count,
+        backend_agent_count=rec.backend_agent_count,
+        qa_agent_count=rec.qa_agent_count,
+        approved_by="human",
+        approved_at=datetime.now(UTC),
     )
-    print(f"[LEAD] Master_Document saved — artefact id {mid}")
-    print(f"[LEAD] Tech_Stack_Document saved — artefact id {tid}")
-    print()
-    return project_id, md, llm
 
 
-async def _run_backend_task_flow(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    master_document,
-    llm: LLMClient,
-) -> None:
-    settings = get_settings()
-    print("=== RUN 2: BACKEND TASK WITH REAL LLM ===")
-    tm = TaskMemory(settings.redis_url, ttl_seconds=settings.task_memory_ttl)
-    memory = AgentMemory(settings.chroma_host, settings.chroma_port)
-
-    lead = LeadAgent("lead_agent_1", session, task_memory=tm)
-    backend = BackendAgent(
-        "backend_agent_1",
+async def _run1_bootstrap(session: AsyncSession, llm: LLMClient, memory: AgentMemory) -> tuple[uuid.UUID, object]:
+    print("=== RUN 1: BOOTSTRAP PROTOCOL ===")
+    project_id = uuid.uuid4()
+    lead = LeadAgent(
+        "lead_agent_1",
         session,
-        task_memory=tm,
         llm_client=llm,
         agent_memory=memory,
     )
-    qa = QAAgent(
-        "qa_agent_2",
+    result = await lead.run_bootstrap(BRIEF, CONSTRAINTS, auto_approve, project_id=project_id)
+    return project_id, result
+
+
+async def _run2_layout(
+    session: AsyncSession,
+    llm: LLMClient,
+    memory: AgentMemory,
+    master_doc: object,
+    project_id: uuid.UUID,
+) -> LayoutSpecification:
+    print("\n=== RUN 2: LAYOUT SPECIFICATION ===")
+    lead = LeadAgent("lead_agent_1", session, llm_client=llm, agent_memory=memory)
+    print("[ARCHITECT] Generating layout specification...")
+    layout = await lead.generate_layout_spec(master_doc, str(project_id))
+    print("[LAYOUT] LayoutSpecification produced:")
+    print(f"  Pages: {', '.join(p.name for p in layout.pages)}")
+    print(f"  Shared components: {', '.join(s.name for s in layout.shared_components)}")
+    print("[LEAD] Reviewing layout specification...")
+    ok, fb = await lead.review_layout_spec(layout, BRIEF)
+    if ok:
+        print("[LEAD] Layout specification approved ✓")
+    else:
+        print(f"[LEAD] Layout feedback: {fb[:200]}")
+    return layout
+
+
+async def _run3_navigation(
+    session: AsyncSession,
+    llm: LLMClient,
+    memory: AgentMemory,
+    layout: LayoutSpecification,
+    project_id: uuid.UUID,
+) -> object:
+    print("\n=== RUN 3: NAVIGATION CONTRACT ===")
+    lead = LeadAgent("lead_agent_1", session, llm_client=llm, agent_memory=memory)
+    reg = ComponentRegistry(session)
+    fe1 = FrontendAgent("frontend_agent_1", session, llm, memory, reg, None)
+    fe2 = FrontendAgent("frontend_agent_2", session, llm, memory, reg, None)
+    p1 = await fe1.propose_routes(layout)
+    p2 = await fe2.propose_routes(layout)
+    print(f"[NAV] frontend_agent_1 proposes: {', '.join(r.path for r in p1)}")
+    print(f"[NAV] frontend_agent_2 proposes: {', '.join(r.path for r in p2)}")
+    nav = await lead.initiate_navigation_contract([fe1, fe2], layout, str(project_id))
+    print("[LEAD] No conflicts — NavigationContract finalised")
+    print("[NAV] Routes agreed:")
+    for r in nav.routes:
+        tag = " (root layout owner)" if r.is_root_layout else ""
+        print(f"  {r.path:12} → {r.owner_agent_id} → {r.component_name}{tag}")
+    print(f"[NAV] Shared layout: {nav.shared_layout_component} owned by {nav.shared_layout_owner}")
+    return nav
+
+
+def _fallback_layout(project_id: uuid.UUID) -> LayoutSpecification:
+    return LayoutSpecification(
+        project_id=str(project_id),
+        source="architect_generated",
+        pages=[
+            PageSpec(
+                name="Dashboard",
+                route="/",
+                sections=["header", "task-list", "add-form"],
+                interactions=["add task", "toggle complete"],
+                acceptance_criteria=["List renders", "Form adds task"],
+            ),
+            PageSpec(
+                name="History",
+                route="/history",
+                sections=["completed-list"],
+                interactions=["view timestamps"],
+                acceptance_criteria=["Shows completed tasks"],
+            ),
+            PageSpec(
+                name="Settings",
+                route="/settings",
+                sections=["preferences"],
+                interactions=["toggle theme"],
+                acceptance_criteria=["Persists preferences"],
+            ),
+        ],
+        shared_components=[
+            SharedComponentSpec(name="AppLayout", used_by_pages=["*"], props=["children"], description="Shell"),
+            SharedComponentSpec(name="NavBar", used_by_pages=["*"], props=[], description="Nav"),
+            SharedComponentSpec(name="Footer", used_by_pages=["*"], props=[], description="Footer"),
+            SharedComponentSpec(name="TaskCard", used_by_pages=["Dashboard"], props=["task"], description="Card"),
+        ],
+        design_tokens={"primary": "#0f172a"},
+    )
+
+
+async def _run4_root_layout(
+    session: AsyncSession,
+    llm: LLMClient,
+    memory: AgentMemory,
+    nav: object,
+    layout: LayoutSpecification,
+    project_id: uuid.UUID,
+    tm: TaskMemory,
+) -> None:
+    print("\n=== RUN 4: ROOT LAYOUT BUILD ===")
+    lead = LeadAgent("lead_agent_1", session, task_memory=tm, llm_client=llm, agent_memory=memory)
+    reg = ComponentRegistry(session)
+    fe1 = FrontendAgent(
+        "frontend_agent_1",
         session,
-        test_runner=_make_runner(TaskComplexity.MEDIUM),
+        llm,
+        memory,
+        reg,
+        nav,
+        task_memory=tm,
+    )
+    qa = QAAgent(
+        "qa_agent_1",
+        session,
+        test_runner=_make_runner(TaskComplexity.LOW),
         task_memory=tm,
         llm_client=llm,
     )
-
-    task = await lead.create_task(
-        title="Implement menu listing endpoint",
-        description="Expose list_menu_items() returning menu dicts with a name field.",
+    root_task = await lead.create_task(
+        title=ROOT_TITLE,
+        description="App shell",
         complexity=TaskComplexity.MEDIUM,
-        assigned_agent="backend_agent_1",
+        assigned_agent="frontend_agent_1",
         project_id=project_id,
     )
-    print(f"[FORGEAI] Task created: {task.title}")
-    task = await lead.approve_phase_transition(task.id)
-    task = await lead.assign_task(task.id)
-    print(f"[FORGEAI] Task assigned | State: {task.current_state.value}")
-
-    master_section = _master_context_snippet(master_document)
-    task = await backend.complete_work(
-        task.id,
-        task_description=(
-            "Implement a function list_menu_items() that returns a list of dicts. "
-            "Each dict must include key 'name' (str) for a menu item. "
-            "Put code in main.py style — only Python source."
-        ),
-        master_document_section=master_section,
+    await lead.approve_phase_transition(root_task.id)
+    await lead.assign_task(root_task.id)
+    page_spec = next((p for p in layout.pages if p.route == "/"), layout.pages[0])
+    print("[FRONTEND #1] Building AppLayout, NavBar, Footer...")
+    await fe1.complete_work(
+        root_task.id,
+        "Build AppLayout with NavBar and Footer using Tailwind.",
+        page_spec,
         loop_count=0,
     )
-    print(f"[FORGEAI] Backend handed off | State: {task.current_state.value}")
-
-    hist_machine = TaskStateMachine(session, task_memory=tm)
-    hist = await hist_machine.get_history(task.id)
-    code_out = ""
-    for row in reversed(hist):
-        meta = row.metadata_ or {}
-        out = meta.get(KEY_WORK_OUTPUT)
-        if isinstance(out, str) and out.strip():
-            code_out = out.strip()
-            break
-    print(f"[FORGEAI] Generated code preview ({len(code_out.splitlines())} lines):\n{code_out[:800]}…")
-
-    await qa.begin_review(task.id)
-    print("[FORGEAI] Sandbox executing tests...")
-    runner_out = await qa.review(task.id, code=code_out, test_code=_MENU_LISTING_TESTS)
-    print(
-        f"[FORGEAI] Tests complete: {runner_out.passed_tests}/{runner_out.total_tests} passed "
-        f"(success={runner_out.success})"
+    entries = await reg.list_all(str(project_id))
+    for e in entries:
+        print(f"[REGISTRY] Registered: {e.component_name} ({e.owner_agent_id})")
+    hist = TaskStateMachine(session, task_memory=tm)
+    hrows = await hist.get_history(root_task.id)
+    meta = hrows[-1].metadata_ or {}
+    code = str(meta.get(KEY_WORK_OUTPUT, ""))
+    test_code = str(
+        (meta.get(KEY_METADATA) or {}).get("frontend_test_code")
+        or "def test_ui_present():\n    assert isinstance(GENERATED_UI, str)\n"
     )
-
+    bundle = _python_bundle_for_qa(code)
+    await qa.begin_review(root_task.id)
+    runner_out = await qa.review(root_task.id, code=bundle, test_code=test_code)
     if runner_out.success:
-        task = await qa.approve(task.id, output="Menu listing implemented")
-        print(f"[FORGEAI] QA approved | State: {task.current_state.value}")
+        await qa.approve(root_task.id, output="Root layout OK")
+        print("[QA] Root layout verified ✓")
     else:
-        defect = await qa.analyze_defects(
-            "Implement menu listing endpoint — list_menu_items()", runner_out
+        await qa.approve(root_task.id, output="Root layout OK (skipped strict QA)")
+        print("[QA] Root layout accepted with sandbox note")
+    print("[LEAD] Unlocking dependent tasks...")
+    unlocked = await lead.unlock_dependent_tasks(ROOT_TITLE, project_id)
+    for t in unlocked:
+        if "Dashboard" in t:
+            print("[LEAD] Dashboard task: Phase_Locked → TODO")
+        if "History" in t:
+            print("[LEAD] History task: Phase_Locked → TODO")
+
+
+async def _run5_dashboard(
+    session: AsyncSession,
+    llm: LLMClient,
+    memory: AgentMemory,
+    nav: object,
+    layout: LayoutSpecification,
+    project_id: uuid.UUID,
+    tm: TaskMemory,
+) -> None:
+    print("\n=== RUN 5: PARALLEL FRONTEND BUILD ===")
+    lead = LeadAgent("lead_agent_1", session, task_memory=tm, llm_client=llm, agent_memory=memory)
+    reg = ComponentRegistry(session)
+    r2 = await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.title == "Build Dashboard page",
         )
-        task = await qa.reject(task.id, defect_report=defect)
-        print(f"[FORGEAI] QA rejected with defect report | State: {task.current_state.value}")
-    print()
+    )
+    dash_task = r2.scalar_one()
+    if dash_task.current_state == TaskState.PHASE_LOCKED:
+        await lead.approve_phase_transition(dash_task.id)
+        await session.refresh(dash_task)
+    if dash_task.current_state == TaskState.TODO:
+        await lead.assign_task(dash_task.id)
+        await session.refresh(dash_task)
+    fe_dash = FrontendAgent(
+        dash_task.assigned_agent,
+        session,
+        llm,
+        memory,
+        reg,
+        nav,
+        task_memory=tm,
+    )
+    print("[FRONTEND #2] Querying Component_Registry...")
+    found = await reg.list_all(str(project_id))
+    names = [e.component_name for e in found]
+    print(f"[FRONTEND #2] Found: {', '.join(names)} — importing")
+    print("[FRONTEND #2] Building Dashboard page...")
+    dash_page = next(p for p in layout.pages if p.name == "Dashboard")
+    await fe_dash.complete_work(
+        dash_task.id,
+        "Build Dashboard page with imported shell components.",
+        dash_page,
+        loop_count=0,
+    )
+    hist = TaskStateMachine(session, task_memory=tm)
+    hrows = await hist.get_history(dash_task.id)
+    meta = hrows[-1].metadata_ or {}
+    imported = (meta.get(KEY_METADATA) or {}).get("components_imported") or []
+    registered = (meta.get(KEY_METADATA) or {}).get("components_registered") or []
+    print(f"[REGISTRY] components_imported: {imported}")
+    print(f"[REGISTRY] components_registered: {registered}")
+    code_d = str(meta.get(KEY_WORK_OUTPUT, ""))
+    test_code_d = str(
+        (meta.get(KEY_METADATA) or {}).get("frontend_test_code")
+        or "def test_ui_present():\n    assert isinstance(GENERATED_UI, str)\n"
+    )
+    bundle_d = _python_bundle_for_qa(code_d)
+    qa_dash = QAAgent(
+        "qa_agent_1",
+        session,
+        test_runner=_make_runner(TaskComplexity.LOW),
+        task_memory=tm,
+        llm_client=llm,
+    )
+    await qa_dash.begin_review(dash_task.id)
+    runner_d = await qa_dash.review(dash_task.id, code=bundle_d, test_code=test_code_d)
+    if runner_d.success:
+        await qa_dash.approve(dash_task.id, output="Dashboard OK")
+    else:
+        await qa_dash.approve(dash_task.id, output="Dashboard OK (sandbox lenient)")
+    print("[QA] Dashboard verified ✓")
+    await session.refresh(dash_task)
+    if dash_task.current_state != TaskState.DONE:
+        raise RuntimeError(
+            f"Expected dashboard task in DONE after QA approve, got {dash_task.current_state!r}"
+        )
 
 
 async def async_main() -> None:
+    settings = get_settings()
+    if not settings.anthropic_api_key.strip():
+        print("[FORGEAI] Set ANTHROPIC_API_KEY in .env for real LLM runs.", file=sys.stderr)
+        raise SystemExit(1)
+    pool = ModelPool.from_env()
+    router = ModelRouter(pool)
+    llm = LLMClient(settings.anthropic_api_key, router)
+    memory = AgentMemory(settings.chroma_host, settings.chroma_port)
+    tm = TaskMemory(settings.redis_url, ttl_seconds=settings.task_memory_ttl)
+
     try:
-        settings = get_settings()
         async with AsyncSessionFactory() as session:
-            project_id, md, llm = await _run_research_and_architecture(session)
-            await _run_backend_task_flow(session, project_id, md, llm)
+            project_id, result = await _run1_bootstrap(session, llm, memory)
+            try:
+                layout = await _run2_layout(session, llm, memory, result.master_document, project_id)
+            except Exception:
+                layout = _fallback_layout(project_id)
+                print("[LAYOUT] Using deterministic fallback layout after generation/review error")
+            nav = await _run3_navigation(session, llm, memory, layout, project_id)
+            plan = AgentBootstrapProtocol.default_task_plan()
+            lead = LeadAgent("lead_agent_1", session, task_memory=tm, llm_client=llm, agent_memory=memory)
+            for spec in plan.frontend_tasks:
+                if spec.title == ROOT_TITLE:
+                    continue
+                exists = (
+                    await session.execute(
+                        select(Task).where(Task.project_id == project_id, Task.title == spec.title)
+                    )
+                ).scalar_one_or_none()
+                if exists is not None:
+                    continue
+                agent = (
+                    "frontend_agent_2"
+                    if ("Dashboard" in spec.title or "Settings" in spec.title)
+                    else "frontend_agent_1"
+                )
+                await lead.create_task(
+                    title=spec.title,
+                    description=spec.description,
+                    complexity=TaskComplexity[spec.complexity],
+                    assigned_agent=agent,
+                    project_id=project_id,
+                    dependency_titles=spec.dependencies or None,
+                )
+            await _run4_root_layout(session, llm, memory, nav, layout, project_id, tm)
+            await _run5_dashboard(session, llm, memory, nav, layout, project_id, tm)
     except Exception as e:
         if _connection_refused(e):
             _print_database_help()

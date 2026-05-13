@@ -41,6 +41,18 @@ llm_client is optional on QAAgent.
 analyze_defects() uses LOW tier for plain-text defect summaries.
 Only called when llm_client is provided.
 
+------
+
+## Phase 6 Discoveries:
+
+### 1. Layout specification fallback
+LayoutSpecification generation can fail schema validation after LLM call.
+A deterministic fallback layout is generated from Master_Document components
+when LLM output cannot be parsed or Lead_Agent review fails.
+Same pattern as research_agent LOW→MEDIUM fallback.
+Applies to: any agent producing LayoutSpecification documents.
+
+------
 
 ## Phase 9 Targets — Agent Memory Upgrades
 
