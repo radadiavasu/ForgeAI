@@ -40,3 +40,39 @@ LLM path used from Phase 5 onward in main.py.
 llm_client is optional on QAAgent.
 analyze_defects() uses LOW tier for plain-text defect summaries.
 Only called when llm_client is provided.
+
+
+## Phase 9 Targets — Agent Memory Upgrades
+
+### 1. Lesson confidence levels
+Write lessons at whichever escalation phase the solution is found, not just Phase 4.
+Tag each lesson with confidence based on resolution phase:
+  Phase 1 or 2 resolved → confidence: "low"
+  Phase 3 resolved → confidence: "medium"
+  Phase 4 resolved → confidence: "high"
+  Phase 5 resolved → confidence: "high" + human_verified: True
+Agents treat high confidence as directive, medium as advisory, low as hint only.
+
+### 2. Lesson flagging and health score
+When a new agent follows a lesson and still fails, flag that lesson immediately.
+Flagged lessons filtered out of search results until reviewed.
+Track health_score per lesson: success_count / total_use_count.
+Inject lessons weighted by health score.
+A lesson with 40% health is a weak hint. A lesson with 95% health is a strong directive.
+
+### 3. Context guards
+Every lesson carries context metadata written at creation time:
+  tech_stack, framework_version, environment, auth_type.
+Before injecting a lesson, check if current project context matches guards.
+A lesson written for React 17 never reaches an agent building React 19.
+Vector search finds the lesson. Context guards decide if it gets injected.
+
+### 4. Agent-driven compatibility check (highest priority)
+Instead of blindly injecting lessons, the agent actively evaluates compatibility.
+Agent already has: Master_Document, Tech_Stack_Document, assigned task.
+When a lesson is matched, agent does a three-way comparison:
+  APPLY: lesson fully compatible with project context → follow as first priority
+  ADAPT: lesson intent is right, specifics differ → follow intent, adjust to current stack
+  IGNORE: lesson contradicts project context → proceed independently
+Priority order: Project docs always win. Lesson is a shortcut only when compatible.
+Implement via structured prompt section given to every agent before task execution.
