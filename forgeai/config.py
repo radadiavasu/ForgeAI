@@ -28,6 +28,18 @@ class Settings(BaseSettings):
     sandbox_timeout_medium: int = 180
     sandbox_timeout_high: int = 600
     sandbox_working_dir: str = "/sandbox"
+    frontend_sandbox_image: str = Field(
+        default="forgeai-frontend-sandbox:latest",
+        validation_alias="FRONTEND_SANDBOX_IMAGE",
+    )
+    frontend_sandbox_network: str = Field(
+        default="bridge",
+        validation_alias="FRONTEND_SANDBOX_NETWORK",
+    )
+    frontend_sandbox_memory_limit: str = Field(
+        default="1g",
+        validation_alias="FRONTEND_SANDBOX_MEMORY_LIMIT",
+    )
     drift_threshold: int = 40
     max_self_retries: int = 2
     redis_url: str = "redis://localhost:6379"

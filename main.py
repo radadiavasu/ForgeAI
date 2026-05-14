@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sys
 import uuid
 from datetime import UTC, datetime
@@ -27,6 +28,7 @@ from forgeai.llm.schemas import ModelPool
 from forgeai.memory.agent_memory import AgentMemory
 from forgeai.memory.task_memory import TaskMemory
 from forgeai.models.task import Task, TaskComplexity
+from forgeai.sandbox.frontend_sandbox import FrontendSandbox
 from forgeai.sandbox.runner import TestRunner
 from forgeai.sandbox.sandbox import Sandbox, SandboxConfig
 from forgeai.state_machine.machine import TaskStateMachine
@@ -86,6 +88,22 @@ def _make_runner(complexity: TaskComplexity) -> TestRunner:
         ),
     )
     return TestRunner(sandbox)
+
+
+def _make_frontend_sandbox(complexity: TaskComplexity) -> FrontendSandbox:
+    settings = get_settings()
+    return FrontendSandbox(
+        complexity=complexity.value,
+        config=SandboxConfig(
+            image=settings.sandbox_image,
+            cpu_limit=settings.sandbox_cpu_limit,
+            memory_limit=settings.sandbox_memory_limit,
+            timeout_low=settings.sandbox_timeout_low,
+            timeout_medium=settings.sandbox_timeout_medium,
+            timeout_high=settings.sandbox_timeout_high,
+            working_dir=settings.sandbox_working_dir,
+        ),
+    )
 
 
 def _python_bundle_for_qa(react_code: str) -> str:
@@ -209,7 +227,7 @@ async def _run4_root_layout(
     layout: LayoutSpecification,
     project_id: uuid.UUID,
     tm: TaskMemory,
-) -> None:
+) -> str:
     print("\n=== RUN 4: ROOT LAYOUT BUILD ===")
     lead = LeadAgent("lead_agent_1", session, task_memory=tm, llm_client=llm, agent_memory=memory)
     reg = ComponentRegistry(session)
@@ -273,6 +291,50 @@ async def _run4_root_layout(
             print("[LEAD] Dashboard task: Phase_Locked → TODO")
         if "History" in t:
             print("[LEAD] History task: Phase_Locked → TODO")
+    return code
+
+
+async def _run6_playwright_frontend_qa(
+    session: AsyncSession,
+    llm: LLMClient,
+    nav: object,
+    layout: LayoutSpecification,
+    root_react_code: str,
+    tm: TaskMemory,
+) -> None:
+    print("\n=== RUN 6: PLAYWRIGHT FRONTEND QA ===")
+    dash_page = next(p for p in layout.pages if p.name == "Dashboard")
+    qa_pw = QAAgent(
+        "qa_agent_1",
+        session,
+        test_runner=None,
+        task_memory=tm,
+        llm_client=llm,
+        # Browser E2E routinely exceeds LOW (60s); MEDIUM matches typical Playwright runs in Docker.
+        frontend_sandbox=_make_frontend_sandbox(TaskComplexity.MEDIUM),
+    )
+    print("[QA] Generating Playwright tests for Dashboard page...")
+    pw_tests = await qa_pw.generate_playwright_tests(dash_page, nav)
+    n_cases = len(re.findall(r"\btest\s*\(", pw_tests))
+    print(f"[QA] Tests generated — {n_cases} test cases")
+    synthetic_task_id = uuid.uuid4()
+    runner_out = await qa_pw.review(
+        synthetic_task_id,
+        code=root_react_code,
+        test_code=pw_tests,
+        development_phase="FRONTEND_PHASE",
+    )
+    print("\n--- PLAYWRIGHT RESULTS ---")
+    print(f"Success: {runner_out.success}" + (f" — {runner_out.sandbox_error}" if runner_out.sandbox_error else ""))
+    print(
+        f"Total: {runner_out.total_tests} | Passed: {runner_out.passed_tests} | "
+        f"Failed: {runner_out.failed_tests}"
+    )
+    for case in runner_out.test_cases:
+        mark = "✓" if case.passed else "✗"
+        print(f"  {mark} {case.name}")
+    if runner_out.timed_out:
+        print(f"  (timed out: {runner_out.sandbox_error})")
 
 
 async def _run5_dashboard(
@@ -400,8 +462,9 @@ async def async_main() -> None:
                     project_id=project_id,
                     dependency_titles=spec.dependencies or None,
                 )
-            await _run4_root_layout(session, llm, memory, nav, layout, project_id, tm)
+            root_react_code = await _run4_root_layout(session, llm, memory, nav, layout, project_id, tm)
             await _run5_dashboard(session, llm, memory, nav, layout, project_id, tm)
+            await _run6_playwright_frontend_qa(session, llm, nav, layout, root_react_code, tm)
     except Exception as e:
         if _connection_refused(e):
             _print_database_help()

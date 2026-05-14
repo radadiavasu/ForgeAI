@@ -7,7 +7,7 @@ from typing import Final
 
 from forgeai.exceptions import SandboxProvisionError, SandboxTimeoutError
 from forgeai.sandbox.sandbox import Sandbox
-from forgeai.sandbox.schemas import RunnerOutput, TestCaseResult
+from forgeai.sandbox.schemas import RunnerOutput, SandboxTestCaseResult
 
 _RESULT_LINE_RE: Final[re.Pattern[str]] = re.compile(
     r"^(\S+::\S+)\s+(PASSED|FAILED)(?:\s+\[[^\]]+\])?\s*$",
@@ -100,12 +100,12 @@ class TestRunner:
                 sandbox_error=sandbox_error or "No output captured",
             )
 
-        test_cases: list[TestCaseResult] = []
+        test_cases: list[SandboxTestCaseResult] = []
         for name, status in _RESULT_LINE_RE.findall(stdout):
             test_name = name.split("::", maxsplit=1)[-1].strip()
             passed = status == "PASSED"
             test_cases.append(
-                TestCaseResult(name=test_name, passed=passed, stdout="", error="")
+                SandboxTestCaseResult(name=test_name, passed=passed, stdout="", error="")
             )
 
         if not test_cases:

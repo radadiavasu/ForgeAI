@@ -3,7 +3,7 @@
 from pydantic import BaseModel
 
 
-class TestCaseResult(BaseModel):
+class SandboxTestCaseResult(BaseModel):
     """Result of an individual test case."""
 
     name: str
@@ -19,7 +19,7 @@ class RunnerOutput(BaseModel):
     total_tests: int
     passed_tests: int
     failed_tests: int
-    test_cases: list[TestCaseResult]
+    test_cases: list[SandboxTestCaseResult]
     stdout: str
     stderr: str
     execution_time_seconds: float
