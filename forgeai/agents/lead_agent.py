@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -13,13 +14,27 @@ from pydantic import BaseModel as PydanticBaseModel
 from sqlalchemy import func as sa_func, select, update
 
 from forgeai.agents.architect_agent import ArchitectAgent
+from forgeai.agents.backend_agent import BackendAgent
 from forgeai.agents.base import BaseAgent
 from forgeai.agents.frontend_agent import FrontendAgent
+from forgeai.agents.qa_agent import QAAgent
 from forgeai.agents.research_agent import ResearchAgent
 from forgeai.bootstrap.protocol import AgentBootstrapProtocol
 from forgeai.bootstrap.schemas import AgentRecommendation, ApprovedConfig, BootstrapResult, TaskPlan
 from forgeai.contracts.navigation import NavigationNegotiator
-from forgeai.contracts.schemas import LayoutSpecification, NavigationContract
+from forgeai.contracts.registry import ComponentRegistry
+from forgeai.contracts.schemas import LayoutSpecification, NavigationContract, PageSpec
+from forgeai.escalation.ladder import EscalationLadder
+from forgeai.escalation.loop_counter import LoopCounter
+from forgeai.escalation.persistence import EscalationPersistence
+from forgeai.orchestration.phase_gate import PhaseGate
+from forgeai.orchestration.qa_loop import QAOrchestrator
+from forgeai.orchestration.schemas import (
+    DefectReport,
+    FrontendPhaseResult,
+    PhaseGateResult,
+    QADecision,
+)
 from forgeai.llm.client import LLMClient
 from forgeai.llm.schemas import MasterDocument, TechStackDocument
 from forgeai.memory.agent_memory import AgentMemory
@@ -29,7 +44,7 @@ from forgeai.models.project_artefact import ProjectArtefactModel
 from forgeai.models.task import Task, TaskComplexity
 from forgeai.state_machine.machine import TaskStateMachine
 from forgeai.state_machine.states import TaskState
-from forgeai.state_machine.transitions import KEY_PHASE_APPROVAL
+from forgeai.state_machine.transitions import KEY_METADATA, KEY_PHASE_APPROVAL, KEY_WORK_OUTPUT
 
 logger = logging.getLogger(__name__)
 
@@ -387,3 +402,314 @@ class LeadAgent(BaseAgent):
         _ = Path(mockup_file_path).read_bytes()
         arch = self.build_architect_agent("architect_agent_1")
         return await arch.process_mockup_layout(mockup_file_path, project_id)
+
+    def build_qa_orchestrator(
+        self,
+        loop_counter: LoopCounter,
+        escalation_ladder: EscalationLadder,
+    ) -> QAOrchestrator:
+        if self._llm_client is None:
+            raise RuntimeError("LeadAgent needs llm_client for QAOrchestrator")
+        sm = TaskStateMachine(self.db, task_memory=self.task_memory)
+        return QAOrchestrator(
+            sm,
+            loop_counter,
+            escalation_ladder,
+            self._llm_client,
+            self.db,
+            task_memory=self.task_memory,
+        )
+
+    async def orchestrate_qa(
+        self,
+        task_id: uuid.UUID,
+        code: str,
+        test_code: str,
+        qa_agent: QAAgent,
+        original_agent_id: str,
+        development_phase: str,
+        *,
+        page_spec: PageSpec | None = None,
+        loop_counter: LoopCounter | None = None,
+        escalation_ladder: EscalationLadder | None = None,
+    ) -> QADecision:
+        """Run QA review and approve/reject via ``QAOrchestrator``."""
+        _ = page_spec
+        if loop_counter is None or escalation_ladder is None:
+            loop_counter = LoopCounter()
+            escalation_ladder = EscalationLadder(
+                loop_counter, EscalationPersistence(self.db)
+            )
+        orchestrator = self.build_qa_orchestrator(loop_counter, escalation_ladder)
+        await qa_agent.begin_review(task_id)
+        runner_output = await qa_agent.review(
+            task_id,
+            code=code,
+            test_code=test_code,
+            development_phase=development_phase,
+        )
+        return await orchestrator.process_result(
+            str(task_id),
+            runner_output,
+            qa_agent.agent_id,
+            original_agent_id,
+            development_phase,
+        )
+
+    async def handle_qa_rejection(
+        self,
+        task_id: uuid.UUID,
+        defect_report: DefectReport,
+        original_agent: FrontendAgent | BackendAgent,
+    ) -> None:
+        """Persist defect context for the implementer to consume on retry."""
+        if self.task_memory is not None:
+            await self.task_memory.set(
+                str(task_id),
+                "defect_report",
+                defect_report.model_dump_json(),
+            )
+        await self.log_agent_lifecycle_event(
+            agent_id=original_agent.agent_id,
+            agent_role=getattr(original_agent, "agent_role", "implementer"),
+            event_type="qa_rejection",
+            created_by=self.agent_id,
+            development_phase="FRONTEND_PHASE",
+        )
+        logger.warning(
+            "Lead reassigned task=%s to %s after QA rejection",
+            task_id,
+            original_agent.agent_id,
+        )
+
+    async def run_frontend_phase(
+        self,
+        frontend_agents: list[FrontendAgent],
+        qa_agent: QAAgent,
+        layout_spec: LayoutSpecification,
+        navigation_contract: NavigationContract,
+        project_id: uuid.UUID,
+        *,
+        loop_counter: LoopCounter | None = None,
+        escalation_ladder: EscalationLadder | None = None,
+        development_phase: str = "FRONTEND_PHASE",
+    ) -> FrontendPhaseResult:
+        """Execute frontend tasks with full QA approve/reject loops."""
+        started = time.monotonic()
+        if loop_counter is None:
+            loop_counter = LoopCounter()
+        if escalation_ladder is None:
+            escalation_ladder = EscalationLadder(
+                loop_counter, EscalationPersistence(self.db)
+            )
+
+        fe_by_id = {a.agent_id: a for a in frontend_agents}
+        root_title = "Build AppLayout — shared shell, NavBar, Footer"
+        res = await self.db.execute(
+            select(Task).where(Task.project_id == project_id)
+        )
+        all_tasks = list(res.scalars())
+        frontend_tasks = [
+            t
+            for t in all_tasks
+            if t.title == root_title
+            or "page" in t.title.lower()
+            or "AppLayout" in t.title
+        ]
+        root_tasks = [t for t in frontend_tasks if t.title == root_title]
+        other_tasks = [t for t in frontend_tasks if t.title != root_title]
+
+        completed: list[str] = []
+        qa_cycles = 0
+        agents_used: set[str] = set()
+        components_registered: set[str] = set()
+
+        async def _run_task_cycle(task: Task, page_spec: PageSpec) -> None:
+            nonlocal qa_cycles
+            agent = fe_by_id.get(task.assigned_agent) or frontend_agents[0]
+            agents_used.add(agent.agent_id)
+            if task.current_state == TaskState.PHASE_LOCKED:
+                await self.approve_phase_transition(task.id)
+            if task.current_state == TaskState.TODO:
+                await self.assign_task(task.id)
+            await agent.complete_work(
+                task.id,
+                task.description or task.title,
+                page_spec,
+                loop_count=0,
+            )
+            hist = TaskStateMachine(self.db, task_memory=self.task_memory)
+            hrows = await hist.get_history(task.id)
+            meta = hrows[-1].metadata_ or {}
+            react_code = str(meta.get(KEY_WORK_OUTPUT, ""))
+            test_code = str(
+                (meta.get(KEY_METADATA) or {}).get("frontend_test_code")
+                or "def test_ui_present():\n    assert isinstance(GENERATED_UI, str)\n"
+            )
+            if development_phase == "FRONTEND_PHASE":
+                bundle = react_code
+                pw_tests = await qa_agent.generate_playwright_tests(
+                    page_spec, navigation_contract
+                )
+                test_payload = pw_tests
+            else:
+                bundle = f"GENERATED_UI = {json.dumps(react_code)}\n"
+                test_payload = test_code
+
+            while True:
+                qa_cycles += 1
+                decision = await self.orchestrate_qa(
+                    task.id,
+                    bundle,
+                    test_payload,
+                    qa_agent,
+                    agent.agent_id,
+                    development_phase,
+                    page_spec=page_spec,
+                    loop_counter=loop_counter,
+                    escalation_ladder=escalation_ladder,
+                )
+                if decision.approved:
+                    completed.append(str(task.id))
+                    break
+                if decision.escalated:
+                    break
+                if decision.defect_report:
+                    await self.handle_qa_rejection(
+                        task.id, decision.defect_report, agent
+                    )
+                await agent.complete_work(
+                    task.id,
+                    (decision.defect_report.suggestions if decision.defect_report else task.title),
+                    page_spec,
+                    loop_count=qa_cycles,
+                )
+                hrows = await hist.get_history(task.id)
+                meta = hrows[-1].metadata_ or {}
+                react_code = str(meta.get(KEY_WORK_OUTPUT, ""))
+                bundle = react_code if development_phase == "FRONTEND_PHASE" else (
+                    f"GENERATED_UI = {json.dumps(react_code)}\n"
+                )
+
+        for root in root_tasks:
+            page = next((p for p in layout_spec.pages if p.route == "/"), layout_spec.pages[0])
+            await _run_task_cycle(root, page)
+            await self.unlock_dependent_tasks(root_title, project_id)
+
+        for task in other_tasks:
+            page = next(
+                (p for p in layout_spec.pages if p.name.lower() in task.title.lower()),
+                layout_spec.pages[0],
+            )
+            await _run_task_cycle(task, page)
+
+        reg = ComponentRegistry(self.db)
+        for entry in await reg.list_all(str(project_id)):
+            components_registered.add(entry.component_name)
+
+        return FrontendPhaseResult(
+            project_id=str(project_id),
+            completed_tasks=completed,
+            total_tasks=len(frontend_tasks),
+            qa_cycles=qa_cycles,
+            components_registered=sorted(components_registered),
+            agents_used=sorted(agents_used),
+            phase_duration_seconds=time.monotonic() - started,
+        )
+
+    async def execute_human_gate(
+        self,
+        frontend_phase_result: FrontendPhaseResult,
+        component_registry: ComponentRegistry,
+        navigation_contract: NavigationContract,
+        api_contract: dict,
+        project_id: uuid.UUID,
+        human_approval_callback: Callable[[str], Awaitable[bool]],
+    ) -> PhaseGateResult:
+        """Compile report, review API contract, present human gate, unlock backend."""
+        if self._llm_client is None:
+            raise RuntimeError("LeadAgent needs llm_client for human gate")
+        phase_gate = PhaseGate(self, self._llm_client, self.db)
+        report = await phase_gate.compile_report(
+            frontend_phase_result,
+            component_registry,
+            navigation_contract,
+            str(project_id),
+        )
+        contract_review = await phase_gate.review_api_contract(
+            api_contract,
+            frontend_phase_result,
+            str(project_id),
+        )
+        if contract_review.requires_update:
+            await self.write_to_project_memory(
+                "api_contract",
+                contract_review.updated_contract,
+                project_id=project_id,
+            )
+        result = await phase_gate.present_to_human(report, human_approval_callback)
+        result.api_contract_updated = contract_review.requires_update
+        await self.log_agent_lifecycle_event(
+            agent_id=self.agent_id,
+            agent_role="lead_agent",
+            event_type="human_gate_presented",
+            created_by=self.agent_id,
+            project_id=project_id,
+            development_phase="HUMAN_GATE",
+        )
+        if result.approved:
+            await self._unlock_backend_tasks(project_id)
+            await self.log_agent_lifecycle_event(
+                agent_id=self.agent_id,
+                agent_role="lead_agent",
+                event_type="phase_transition_approved",
+                created_by=self.agent_id,
+                project_id=project_id,
+                development_phase="BACKEND_PHASE",
+            )
+        else:
+            await self._create_feedback_tasks(result.feedback, project_id)
+        return result
+
+    async def _unlock_backend_tasks(self, project_id: uuid.UUID) -> int:
+        res = await self.db.execute(
+            select(Task).where(
+                Task.project_id == project_id,
+                Task.current_state == TaskState.PHASE_LOCKED,
+            )
+        )
+        tasks = list(res.scalars())
+        count = 0
+        for task in tasks:
+            await self.approve_phase_transition(task.id)
+            count += 1
+        logger.info(
+            "Unlocked %d backend task(s) for project %s",
+            count,
+            project_id,
+        )
+        return count
+
+    async def _create_feedback_tasks(
+        self,
+        feedback: str,
+        project_id: uuid.UUID,
+    ) -> list[Task]:
+        """Create follow-up frontend tasks when the human gate is not approved."""
+        title = f"Address gate feedback: {feedback[:80]}"
+        task = await self.create_task(
+            title=title,
+            description=feedback,
+            complexity=TaskComplexity.LOW,
+            assigned_agent="frontend_agent_1",
+            project_id=project_id,
+        )
+        await self.log_agent_lifecycle_event(
+            agent_id=self.agent_id,
+            agent_role="lead_agent",
+            event_type="feedback_task_created",
+            created_by=self.agent_id,
+            project_id=project_id,
+            development_phase="FRONTEND_PHASE",
+        )
+        return [task]

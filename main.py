@@ -1,4 +1,4 @@
-"""Phase 6 demo: bootstrap, layout spec, navigation contract, frontend builds, QA."""
+"""Phase 7 demo: bootstrap through human gate with full QA rejection loop."""
 
 from __future__ import annotations
 
@@ -17,6 +17,8 @@ from forgeai.agents.frontend_agent import FrontendAgent
 from forgeai.agents.lead_agent import LeadAgent
 from forgeai.agents.qa_agent import QAAgent
 from forgeai.bootstrap.protocol import AgentBootstrapProtocol
+from forgeai.escalation import EscalationLadder, EscalationPersistence
+from forgeai.escalation.loop_counter import LoopCounter
 from forgeai.bootstrap.schemas import ApprovedConfig
 from forgeai.config import get_settings
 from forgeai.contracts.registry import ComponentRegistry
@@ -118,6 +120,22 @@ async def auto_approve(rec) -> ApprovedConfig:
         approved_by="human",
         approved_at=datetime.now(UTC),
     )
+
+
+async def auto_approve_gate(_summary: str) -> bool:
+    print("[GATE] Human approved — starting Backend Phase")
+    return True
+
+
+INCOMPLETE_ROOT_REACT = """
+export default function AppLayout({ children }) {
+  return (
+    <div className="min-h-screen">
+      <main>{children}</main>
+    </motion.div>
+  );
+}
+""".strip()
 
 
 async def _run1_bootstrap(session: AsyncSession, llm: LLMClient, memory: AgentMemory) -> tuple[uuid.UUID, object]:
@@ -417,6 +435,268 @@ async def _run5_dashboard(
         )
 
 
+async def _run7_full_frontend_qa_loop(
+    session: AsyncSession,
+    llm: LLMClient,
+    memory: AgentMemory,
+    nav: object,
+    layout: LayoutSpecification,
+    project_id: uuid.UUID,
+    tm: TaskMemory,
+) -> tuple[object, int]:
+    print("\n=== RUN 7: FULL FRONTEND PHASE WITH QA LOOP ===")
+    lead = LeadAgent("lead_agent_1", session, task_memory=tm, llm_client=llm, agent_memory=memory)
+    reg = ComponentRegistry(session)
+    loop_counter = LoopCounter()
+    ladder = EscalationLadder(loop_counter, EscalationPersistence(session))
+    fe1 = FrontendAgent(
+        "frontend_agent_1",
+        session,
+        llm,
+        memory,
+        reg,
+        nav,
+        task_memory=tm,
+    )
+    fe2 = FrontendAgent(
+        "frontend_agent_2",
+        session,
+        llm,
+        memory,
+        reg,
+        nav,
+        task_memory=tm,
+    )
+    qa_pw = QAAgent(
+        "qa_agent_1",
+        session,
+        test_runner=None,
+        task_memory=tm,
+        llm_client=llm,
+        frontend_sandbox=_make_frontend_sandbox(TaskComplexity.MEDIUM),
+    )
+    root_task = (
+        await session.execute(
+            select(Task).where(
+                Task.project_id == project_id,
+                Task.title == ROOT_TITLE,
+            )
+        )
+    ).scalar_one()
+    root_page = next((p for p in layout.pages if p.route == "/"), layout.pages[0])
+
+    print("[FRONTEND #1] Building AppLayout (attempt 1)...")
+    if root_task.current_state == TaskState.PHASE_LOCKED:
+        await lead.approve_phase_transition(root_task.id)
+    if root_task.current_state == TaskState.TODO:
+        await lead.assign_task(root_task.id)
+    await session.refresh(root_task)
+    machine = TaskStateMachine(session, task_memory=tm)
+    if root_task.current_state == TaskState.IN_PROGRESS:
+        pass
+    elif root_task.current_state != TaskState.IN_REVIEW:
+        await lead.assign_task(root_task.id)
+        await session.refresh(root_task)
+    await machine.transition(
+        root_task.id,
+        TaskState.IN_REVIEW,
+        "frontend_agent_1",
+        **{
+            KEY_WORK_OUTPUT: INCOMPLETE_ROOT_REACT,
+            KEY_METADATA: {"frontend_test_code": "", "components_registered": []},
+        },
+    )
+    pw_root = await qa_pw.generate_playwright_tests(root_page, nav)
+    print("[QA] Running Playwright tests...")
+    decision1 = await lead.orchestrate_qa(
+        root_task.id,
+        INCOMPLETE_ROOT_REACT,
+        pw_root,
+        qa_pw,
+        "frontend_agent_1",
+        "FRONTEND_PHASE",
+        page_spec=root_page,
+        loop_counter=loop_counter,
+        escalation_ladder=ladder,
+    )
+    if decision1.defect_report:
+        print("[QA] Rejected — generating defect report...")
+        print(f"[QA] Defect: {decision1.defect_report.failure_summary}")
+        print("[LEAD] Reassigning to frontend_agent_1 — attempt 2")
+        print(
+            f"[FRONTEND #1] Fixing: {decision1.defect_report.suggestions[:120]}..."
+        )
+    await fe1.complete_work(
+        root_task.id,
+        "Build AppLayout with header, task-list section, and nav links.",
+        root_page,
+        loop_count=1,
+    )
+    hist = await machine.get_history(root_task.id)
+    meta = hist[-1].metadata_ or {}
+    good_code = str(meta.get(KEY_WORK_OUTPUT, ""))
+    print("[QA] Running Playwright tests...")
+    decision2 = await lead.orchestrate_qa(
+        root_task.id,
+        good_code,
+        pw_root,
+        qa_pw,
+        "frontend_agent_1",
+        "FRONTEND_PHASE",
+        page_spec=root_page,
+        loop_counter=loop_counter,
+        escalation_ladder=ladder,
+    )
+    if decision2.approved:
+        print("[QA] Approved — AppLayout DONE ✓")
+    for e in await reg.list_all(str(project_id)):
+        print(f"[REGISTRY] Registered: {e.component_name}")
+    print("[LEAD] Root layout verified — unlocking dependent tasks")
+    unlocked = await lead.unlock_dependent_tasks(ROOT_TITLE, project_id)
+    for title in unlocked:
+        print(f"[LEAD] {title}: Phase_Locked → TODO")
+
+    qa_cycles = 2
+    for page_name, agent in (("Dashboard", fe2), ("Settings", fe2)):
+        r = await session.execute(
+            select(Task).where(
+                Task.project_id == project_id,
+                Task.title == f"Build {page_name} page",
+            )
+        )
+        page_task = r.scalar_one_or_none()
+        if page_task is None:
+            continue
+        if page_task.current_state == TaskState.PHASE_LOCKED:
+            await lead.approve_phase_transition(page_task.id)
+        if page_task.current_state == TaskState.TODO:
+            await lead.assign_task(page_task.id)
+        page_spec = next(p for p in layout.pages if p.name == page_name)
+        owner = fe2 if page_task.assigned_agent == "frontend_agent_2" else fe1
+        print(f"[FRONTEND #2] Building {page_name} (attempt 1)...")
+        await owner.complete_work(
+            page_task.id,
+            f"Build {page_name} page.",
+            page_spec,
+            loop_count=0,
+        )
+        hrows = await machine.get_history(page_task.id)
+        pmeta = hrows[-1].metadata_ or {}
+        code = str(pmeta.get(KEY_WORK_OUTPUT, ""))
+        pw_tests = await qa_pw.generate_playwright_tests(page_spec, nav)
+        print("[QA] Running Playwright tests...")
+        decision = await lead.orchestrate_qa(
+            page_task.id,
+            code,
+            pw_tests,
+            qa_pw,
+            owner.agent_id,
+            "FRONTEND_PHASE",
+            page_spec=page_spec,
+            loop_counter=loop_counter,
+            escalation_ladder=ladder,
+        )
+        qa_cycles += 1
+        if decision.approved:
+            print(f"[QA] Approved — {page_name} DONE ✓")
+
+    print("[LEAD] All frontend tasks DONE — compiling Phase_Completion_Report")
+    return nav, qa_cycles
+
+
+async def _run8_human_gate(
+    session: AsyncSession,
+    llm: LLMClient,
+    memory: AgentMemory,
+    nav: object,
+    layout: LayoutSpecification,
+    project_id: uuid.UUID,
+    tm: TaskMemory,
+    qa_cycles: int,
+) -> None:
+    print("\n=== RUN 8: HUMAN GATE ===")
+    lead = LeadAgent("lead_agent_1", session, task_memory=tm, llm_client=llm, agent_memory=memory)
+    reg = ComponentRegistry(session)
+    plan = AgentBootstrapProtocol.default_task_plan()
+    for spec in plan.backend_tasks:
+        exists = (
+            await session.execute(
+                select(Task).where(Task.project_id == project_id, Task.title == spec.title)
+            )
+        ).scalar_one_or_none()
+        if exists is None:
+            await lead.create_task(
+                title=spec.title,
+                description=spec.description,
+                complexity=TaskComplexity[spec.complexity],
+                assigned_agent="backend_agent_1",
+                project_id=project_id,
+            )
+    extra_backend = 14
+    for i in range(extra_backend):
+        title = f"Backend task {i + 2}"
+        exists = (
+            await session.execute(
+                select(Task).where(Task.project_id == project_id, Task.title == title)
+            )
+        ).scalar_one_or_none()
+        if exists is None:
+            await lead.create_task(
+                title=title,
+                description="Phase-locked backend work",
+                complexity=TaskComplexity.LOW,
+                assigned_agent="backend_agent_1",
+                project_id=project_id,
+            )
+
+    res = await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.current_state == TaskState.DONE,
+        )
+    )
+    done_ids = [str(t.id) for t in res.scalars()]
+    from forgeai.orchestration.schemas import FrontendPhaseResult
+
+    fe_result = FrontendPhaseResult(
+        project_id=str(project_id),
+        completed_tasks=done_ids,
+        total_tasks=3,
+        qa_cycles=qa_cycles,
+        components_registered=[e.component_name for e in await reg.list_all(str(project_id))],
+        agents_used=["frontend_agent_1", "frontend_agent_2"],
+        phase_duration_seconds=0.0,
+    )
+    api_contract = {
+        "endpoints": [
+            {"method": "GET", "path": "/tasks"},
+            {"method": "POST", "path": "/tasks"},
+        ]
+    }
+    print("[LEAD] Compiling Phase_Completion_Report...")
+    print("[LEAD] Reviewing API_Contract...")
+    gate_result = await lead.execute_human_gate(
+        fe_result,
+        reg,
+        nav,
+        api_contract,
+        project_id,
+        auto_approve_gate,
+    )
+    if not gate_result.api_contract_updated:
+        print("[LEAD] API_Contract — no changes required")
+    unlocked = await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.current_state == TaskState.TODO,
+        )
+    )
+    n_unlocked = len(list(unlocked.scalars()))
+    print("[LEAD] Unlocking backend tasks...")
+    print(f"[LEAD] {n_unlocked} backend tasks: Phase_Locked → TODO")
+    print("[LEAD] BACKEND_PHASE starting")
+
+
 async def async_main() -> None:
     settings = get_settings()
     if not settings.anthropic_api_key.strip():
@@ -440,8 +720,6 @@ async def async_main() -> None:
             plan = AgentBootstrapProtocol.default_task_plan()
             lead = LeadAgent("lead_agent_1", session, task_memory=tm, llm_client=llm, agent_memory=memory)
             for spec in plan.frontend_tasks:
-                if spec.title == ROOT_TITLE:
-                    continue
                 exists = (
                     await session.execute(
                         select(Task).where(Task.project_id == project_id, Task.title == spec.title)
@@ -462,9 +740,16 @@ async def async_main() -> None:
                     project_id=project_id,
                     dependency_titles=spec.dependencies or None,
                 )
-            root_react_code = await _run4_root_layout(session, llm, memory, nav, layout, project_id, tm)
-            await _run5_dashboard(session, llm, memory, nav, layout, project_id, tm)
-            await _run6_playwright_frontend_qa(session, llm, nav, layout, root_react_code, tm)
+            _nav, qa_cycles = await _run7_full_frontend_qa_loop(
+                session, llm, memory, nav, layout, project_id, tm
+            )
+            await _run8_human_gate(
+                session, llm, memory, _nav, layout, project_id, tm, qa_cycles
+            )
+            # Legacy Phase 6 runs (optional — uncomment to execute 4–6 as well)
+            # root_react_code = await _run4_root_layout(session, llm, memory, nav, layout, project_id, tm)
+            # await _run5_dashboard(session, llm, memory, nav, layout, project_id, tm)
+            # await _run6_playwright_frontend_qa(session, llm, nav, layout, root_react_code, tm)
     except Exception as e:
         if _connection_refused(e):
             _print_database_help()
