@@ -112,3 +112,19 @@ When a lesson is matched, agent does a three-way comparison:
   IGNORE: lesson contradicts project context → proceed independently
 Priority order: Project docs always win. Lesson is a shortcut only when compatible.
 Implement via structured prompt section given to every agent before task execution.
+
+------
+
+## Phase 9 Discoveries
+
+### 1. Final review identifies gaps correctly
+FinalReviewer correctly identifies missing frontend components,
+infrastructure tasks, and database migrations when only backend
+tasks are completed. This is expected behaviour — the demo run
+only completes backend tasks, not the full project.
+In production, final review runs after ALL phases are complete.
+
+### 2. Confidence scorer scored stub output as 15/100
+Backend_Agent correctly scored a stub implementation at 15/100.
+This confirms the confidence scorer is genuinely evaluating output
+quality, not returning arbitrary numbers.
