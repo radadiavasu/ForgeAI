@@ -1022,6 +1022,92 @@ async def _run13_final_review(
         print("[FINAL REVIEW] Gaps require remediation before delivery")
 
 
+async def _change_decision_proceed(_msg: str):
+    from forgeai.lifecycle.schemas import ChangeDecision
+
+    if "REJECT" in _msg.upper():
+        print("[GATE] Human rejected change")
+        return ChangeDecision.REJECT
+    print("[GATE] Human approved — PROCEED")
+    return ChangeDecision.PROCEED
+
+
+async def _scope_approve(_spec: object) -> bool:
+    print("[GATE] Scope approved — executing")
+    return True
+
+
+async def _run14_live_mode(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    master_doc: object,
+) -> None:
+    print("\n=== RUN 14: LIVE MODE ===")
+    from forgeai.lifecycle.project_registry import ProjectRegistry
+
+    reg = ProjectRegistry(session)
+    await reg.ensure_active_project(
+        str(project_id),
+        getattr(master_doc, "project_name", "Task Manager"),
+        getattr(master_doc, "project_summary", BRIEF),
+    )
+    lead = LeadAgent("lead_agent_1", session, llm_client=None, agent_memory=None)
+    print("[LEAD] Destroying execution agents...")
+    await lead.enter_live_mode(project_id, "release-v1")
+    project = await reg.get_project(str(project_id))
+    print("[REGISTRY] Project status: ACTIVE → LIVE")
+    print("[LEAD] Dormancy entered — project is live")
+    if project:
+        print(f"  Status: {project.status.value} | Release: {project.release_tag}")
+
+
+async def _run15_patch_mode(
+    session: AsyncSession,
+    llm: LLMClient,
+    memory: AgentMemory,
+    project_id: uuid.UUID,
+    master_doc: object,
+) -> None:
+    print("\n=== RUN 15: PATCH MODE (BUGFIX) ===")
+    change = (
+        "Fix the task completion endpoint — it returns 200 even when the "
+        "task ID doesn't exist. Should return 404."
+    )
+    print(f"[CHANGE] Received: {change[:60]}...")
+    lead = LeadAgent("lead_agent_1", session, llm_client=llm, agent_memory=memory)
+    await lead.accept_change_request(
+        change,
+        project_id,
+        master_doc,
+        _change_decision_proceed,
+    )
+    print("[REGISTRY] Status: LIVE restored")
+
+
+async def _run16_change_mode(
+    session: AsyncSession,
+    llm: LLMClient,
+    memory: AgentMemory,
+    project_id: uuid.UUID,
+    master_doc: object,
+) -> None:
+    print("\n=== RUN 16: CHANGE MODE (LARGE FEATURE) ===")
+    change = (
+        "Add a team collaboration feature — users should be able to share "
+        "task lists with team members and assign tasks to each other."
+    )
+    print(f"[CHANGE] Received: {change[:60]}...")
+    lead = LeadAgent("lead_agent_1", session, llm_client=llm, agent_memory=memory)
+    await lead.accept_change_request(
+        change,
+        project_id,
+        master_doc,
+        _change_decision_proceed,
+        human_scope_callback=_scope_approve,
+    )
+    print("[REGISTRY] Status: LIVE restored")
+
+
 async def async_main() -> None:
     settings = get_settings()
     if not settings.anthropic_api_key.strip():
@@ -1084,6 +1170,9 @@ async def async_main() -> None:
             await _run13_final_review(
                 session, llm, memory, project_id, result.master_document
             )
+            await _run14_live_mode(session, project_id, result.master_document)
+            await _run15_patch_mode(session, llm, memory, project_id, result.master_document)
+            await _run16_change_mode(session, llm, memory, project_id, result.master_document)
             # Legacy Phase 6 runs (optional — uncomment to execute 4–6 as well)
             # root_react_code = await _run4_root_layout(session, llm, memory, nav, layout, project_id, tm)
             # await _run5_dashboard(session, llm, memory, nav, layout, project_id, tm)

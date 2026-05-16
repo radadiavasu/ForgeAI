@@ -128,3 +128,22 @@ In production, final review runs after ALL phases are complete.
 Backend_Agent correctly scored a stub implementation at 15/100.
 This confirms the confidence scorer is genuinely evaluating output
 quality, not returning arbitrary numbers.
+
+------
+
+## Phase 9B Discoveries
+
+### 1. Cost estimation needs calibration
+Impact analyser estimated $9500 and 8640 minutes for a
+LARGE_FEATURE change. These numbers are unrealistic.
+Root cause: cost_per_task multiplier is too high in the
+estimation formula.
+Fix in Phase 10: recalibrate cost estimates using actual
+token consumption data from Phases 8-9B runs.
+
+### 2. Human correctly rejected unrealistic estimate
+The human confirmation gate correctly stopped the LARGE_FEATURE
+change after presenting the (inflated) cost estimate.
+This proves the gate mechanism works — human saw the numbers
+and rejected. The gate is the right design even when estimates
+are wrong.

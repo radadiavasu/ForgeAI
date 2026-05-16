@@ -2,6 +2,7 @@
 
 import forgeai.models.escalation  # noqa: F401 — register metadata for create_all
 import forgeai.models.agent_lifecycle  # noqa: F401
+import forgeai.models.project  # noqa: F401
 import forgeai.models.project_artefact  # noqa: F401
 
 import fakeredis.aioredis

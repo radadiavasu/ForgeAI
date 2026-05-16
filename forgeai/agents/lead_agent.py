@@ -31,6 +31,7 @@ from forgeai.escalation.persistence import EscalationPersistence
 from forgeai.orchestration.phase_gate import PhaseGate
 from forgeai.orchestration.qa_loop import QAOrchestrator
 from forgeai.intelligence.schemas import FinalReviewResult
+from forgeai.lifecycle.schemas import ChangeDecision, ChangeHistoryEntry
 from forgeai.orchestration.schemas import (
     BackendPhaseResult,
     DefectReport,
@@ -835,3 +836,172 @@ class LeadAgent(BaseAgent):
 
         reviewer = FinalReviewer(self._llm_client, self.db)
         return await reviewer.review(str(project_id), master_document)
+
+    async def enter_live_mode(self, project_id: uuid.UUID, release_tag: str) -> None:
+        """Destroy execution agents and transition project to LIVE dormancy."""
+        from forgeai.lifecycle.project_registry import ProjectRegistry
+
+        registry = ProjectRegistry(self.db)
+        await registry.set_live(str(project_id), release_tag)
+        await self.log_agent_lifecycle_event(
+            agent_id=self.agent_id,
+            agent_role="lead_agent",
+            event_type="live_mode_entered",
+            created_by=self.agent_id,
+            project_id=project_id,
+            development_phase="LIVE",
+        )
+        logger.info(
+            "[LEAD] Dormancy entered — project %s is LIVE (release=%s)",
+            project_id,
+            release_tag,
+        )
+
+    async def accept_change_request(
+        self,
+        change_request: str,
+        project_id: uuid.UUID,
+        master_document: MasterDocument,
+        human_approval_callback: Callable[[str], Awaitable[ChangeDecision]],
+        *,
+        human_scope_callback: Callable[[object], Awaitable[bool]] | None = None,
+    ) -> ChangeHistoryEntry:
+        """Classify, analyse, and execute a change on a LIVE project."""
+        from forgeai.lifecycle.change_classifier import ChangeClassifier
+        from forgeai.lifecycle.change_executor import ChangeExecutor, handle_architectural
+        from forgeai.lifecycle.change_history import write_change_history
+        from forgeai.lifecycle.impact_analyser import ImpactAnalyser
+        from forgeai.lifecycle.patch_executor import PatchExecutor
+        from forgeai.lifecycle.project_registry import ProjectRegistry
+        from forgeai.lifecycle.schemas import (
+            ChangeDecision,
+            ChangeHistoryEntry,
+            ChangeType,
+            HumanChangeApproval,
+            ProjectStatus,
+            RiskLevel,
+        )
+
+        if self._llm_client is None:
+            raise RuntimeError("LeadAgent needs llm_client for change requests")
+
+        registry = ProjectRegistry(self.db)
+        project = await registry.get_project(str(project_id))
+        if project is None or project.status != ProjectStatus.LIVE:
+            raise RuntimeError("Change requests require a LIVE project")
+
+        classifier = ChangeClassifier(self._llm_client)
+        classification = await classifier.classify(
+            change_request,
+            master_document,
+            ProjectStatus.LIVE,
+        )
+        print(
+            f"[CLASSIFIER] {classification.change_type.value} | "
+            f"Risk: {classification.risk_level.value}"
+        )
+
+        analyser = ImpactAnalyser(self._llm_client, self.db)
+        impact = await analyser.analyse(
+            change_request,
+            classification,
+            str(project_id),
+            master_document,
+        )
+        print(
+            f"[IMPACT] {len(impact.affected_task_ids)} task(s) affected | "
+            f"~${impact.estimated_cost_usd:.2f} | ~{impact.estimated_time_minutes} min"
+        )
+
+        if classification.risk_level == RiskLevel.ARCHITECTURAL:
+            decision = await handle_architectural(
+                impact, str(project_id), human_approval_callback
+            )
+            if decision not in ChangeDecision.__members__:
+                decision = ChangeDecision.REJECT
+        elif classification.requires_human_confirmation:
+            print(impact.human_message)
+            decision = await human_approval_callback(impact.human_message)
+        else:
+            print("[CLASSIFIER] LOW risk — auto-proceeding")
+            decision = ChangeDecision.PROCEED
+
+        approval = HumanChangeApproval(
+            project_id=str(project_id),
+            change_request=change_request,
+            impact_analysis=impact,
+            decision=decision,
+        )
+
+        execution_result = None
+        outcome = decision.value
+
+        if decision == ChangeDecision.PROCEED:
+            if classification.change_type in (ChangeType.BUGFIX, ChangeType.SMALL_FEATURE):
+                from forgeai.escalation import EscalationLadder, EscalationPersistence
+                from forgeai.escalation.loop_counter import LoopCounter
+
+                loop_counter = LoopCounter()
+                ladder = EscalationLadder(loop_counter, EscalationPersistence(self.db))
+                qa_orch = self.build_qa_orchestrator(loop_counter, ladder)
+                patch = PatchExecutor(self, qa_orch, self.db)
+                execution_result = await patch.execute(impact, approval, str(project_id))
+                outcome = "PATCH_COMPLETE"
+            elif classification.change_type == ChangeType.LARGE_FEATURE:
+                from forgeai.escalation import EscalationLadder, EscalationPersistence
+                from forgeai.escalation.loop_counter import LoopCounter
+
+                loop_counter = LoopCounter()
+                ladder = EscalationLadder(loop_counter, EscalationPersistence(self.db))
+                qa_orch = self.build_qa_orchestrator(loop_counter, ladder)
+
+                async def _scope_ok(_spec: object) -> bool:
+                    if human_scope_callback is None:
+                        return True
+                    return await human_scope_callback(_spec)
+
+                change_exec = ChangeExecutor(self, self._llm_client, qa_orch, self.db)
+                execution_result = await change_exec.execute_change(
+                    change_request,
+                    approval,
+                    str(project_id),
+                    master_document,
+                    _scope_ok,
+                )
+                outcome = "CHANGE_COMPLETE"
+        elif decision in (ChangeDecision.QUEUE, ChangeDecision.DEFER):
+            await self.write_to_project_memory(
+                "queued_change",
+                approval.model_dump(mode="json"),
+                project_id=project_id,
+            )
+            outcome = f"{decision.value}_STORED"
+
+        entry = ChangeHistoryEntry(
+            entry_id=str(uuid.uuid4()),
+            project_id=str(project_id),
+            change_request=change_request,
+            classification=classification,
+            impact_analysis=impact,
+            human_decision=approval,
+            execution_result=execution_result,
+            outcome=outcome,
+        )
+        await write_change_history(self, entry)
+        print("[HISTORY] Change written to Project_Memory")
+        return entry
+
+    async def archive_project(self, project_id: uuid.UUID) -> None:
+        """Human-triggered LIVE → ARCHIVED transition."""
+        from forgeai.lifecycle.project_registry import ProjectRegistry
+
+        registry = ProjectRegistry(self.db)
+        await registry.set_archived(str(project_id))
+        await self.log_agent_lifecycle_event(
+            agent_id=self.agent_id,
+            agent_role="lead_agent",
+            event_type="project_archived",
+            created_by=self.agent_id,
+            project_id=project_id,
+            development_phase="ARCHIVED",
+        )

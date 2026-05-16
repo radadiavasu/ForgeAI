@@ -38,6 +38,7 @@ _PERMITTED: tuple[_TransitionDef, ...] = (
         TaskState.REWORK,
         requires_rework_reason=True,
     ),
+    _TransitionDef(TaskState.REWORK, TaskState.IN_PROGRESS),
 )
 
 KEY_PHASE_APPROVAL = "phase_transition_approval"
