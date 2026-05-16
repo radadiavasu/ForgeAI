@@ -65,3 +65,9 @@ class BootstrapError(ForgeAIError):
     """Raised when the agent bootstrap protocol cannot complete."""
 
     pass
+
+
+class ContextWindowExceededError(ForgeAIError):
+    """Raised when context cannot be reduced below the model token limit."""
+
+    pass

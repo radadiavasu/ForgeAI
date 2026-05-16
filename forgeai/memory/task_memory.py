@@ -67,6 +67,19 @@ class TaskMemory:
         r = await self._conn()
         return bool(await r.exists(self._key(task_id, key)))
 
+    async def collect_all(self, task_id: str) -> dict[str, str]:
+        """Return all key-value pairs stored for a task."""
+        r = await self._conn()
+        pattern = f"task_memory:{task_id}:*"
+        out: dict[str, str] = {}
+        prefix = f"task_memory:{task_id}:"
+        async for key in r.scan_iter(match=pattern):
+            val = await r.get(key)
+            if val is not None:
+                short = key[len(prefix) :] if key.startswith(prefix) else key
+                out[short] = val
+        return out
+
     async def aclose(self) -> None:
         if self._redis is not None and self._owned_client:
             await self._redis.aclose()

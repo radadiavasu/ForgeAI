@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from anthropic import AsyncAnthropic, RateLimitError
 
-from forgeai.exceptions import LLMRateLimitError
+from forgeai.exceptions import ContextWindowExceededError, LLMRateLimitError
 from forgeai.llm.model_router import ModelRouter
 from forgeai.llm.schemas import LLMResponse
+
+if TYPE_CHECKING:
+    from forgeai.intelligence.context_manager import ContextWindowManager
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +31,16 @@ _OPUS_OUT = 75.00
 class LLMClient:
     """All completion calls go through this class; enforces ``ModelRouter``."""
 
-    def __init__(self, api_key: str, model_router: ModelRouter) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model_router: ModelRouter,
+        *,
+        context_manager: ContextWindowManager | None = None,
+    ) -> None:
         self._client = AsyncAnthropic(api_key=api_key)
         self.router = model_router
+        self.context_manager = context_manager
 
     def _estimate_cost(self, model: str, input_tokens: int, output_tokens: int) -> float:
         """Return estimated cost in USD from token usage and model id."""
@@ -77,9 +87,27 @@ class LLMClient:
         loop_count: int = 0,
         max_tokens: int = 1000,
         tools: list[Any] | None = None,
+        task_id: str | None = None,
+        agent_id: str | None = None,
+        master_doc_section: str | None = None,
     ) -> LLMResponse:
         """Run one routed completion with retries on rate limits."""
         model = self.router.route(complexity, loop_count)
+        if self.context_manager and task_id and agent_id:
+            full_context = system_prompt + user_message
+            reduction = await self.context_manager.check_and_reduce(
+                full_context,
+                model,
+                task_id,
+                agent_id,
+                master_doc_section=master_doc_section,
+            )
+            if not reduction.under_limit:
+                raise ContextWindowExceededError(
+                    f"Context {reduction.final_tokens} tokens exceeds limit after reductions"
+                )
+            if reduction.reduction_applied:
+                user_message = reduction.reduced_context
         kwargs: dict[str, Any] = {
             "model": model,
             "max_tokens": max_tokens,

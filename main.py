@@ -1,4 +1,4 @@
-"""Phase 7 demo: bootstrap through human gate with full QA rejection loop."""
+"""ForgeAI demo: bootstrap through final review (Phases 7–9)."""
 
 from __future__ import annotations
 
@@ -31,9 +31,16 @@ from forgeai.llm.schemas import ModelPool
 from forgeai.memory.agent_memory import AgentMemory
 from forgeai.memory.task_memory import TaskMemory
 from forgeai.models.task import Task, TaskComplexity
+from forgeai.intelligence.confidence import ConfidenceScorer
+from forgeai.intelligence.context_manager import ContextWindowManager
+from forgeai.intelligence.peer_review import PeerReviewer
+from forgeai.memory.lesson_health import LessonHealth, build_context_guards, confidence_from_escalation_level
+from forgeai.memory.schemas import Lesson
+from forgeai.memory.agent_memory import new_lesson_id
 from forgeai.orchestration.backend_orchestrator import BackendOrchestrator, ContractValidator
 from forgeai.orchestration.qa_loop import QAOrchestrator
 from forgeai.orchestration.schemas import FrontendPhaseResult
+from forgeai.llm.schemas import TechStackDocument
 from forgeai.sandbox.frontend_sandbox import FrontendSandbox
 from forgeai.sandbox.runner import TestRunner
 from forgeai.sandbox.sandbox import Sandbox, SandboxConfig
@@ -807,6 +814,214 @@ async def _run10_backend_phase_gate(
     print("[LEAD] Phase: BACKEND_PHASE → FINAL_REVIEW")
 
 
+async def _run11_agent_memory_upgrades(memory: AgentMemory) -> None:
+    print("\n=== RUN 11: AGENT MEMORY UPGRADES ===")
+    pid = "00000000-0000-0000-0000-000000000099"
+    tid = "00000000-0000-0000-0000-000000000098"
+    health = LessonHealth(memory)
+
+    lessons = [
+        ("A", 2, False, "Add retry on connection timeout"),
+        ("B", 3, False, "Use UTC timestamps in API responses"),
+        ("C", 4, False, "Always validate input before database insert"),
+    ]
+    for label, level, human, rule in lessons:
+        conf = confidence_from_escalation_level(level, human)
+        les = Lesson(
+            id=new_lesson_id(),
+            agent_role="backend_agent",
+            failure_description=f"Failure {label}",
+            root_cause="root",
+            resolution="fix",
+            rule=rule,
+            created_at=datetime.now(UTC),
+            project_id=pid,
+            task_id=tid,
+            confidence=conf,
+            human_verified=human,
+            resolved_at_escalation_level=level,
+        )
+        await memory.write_lesson(les)
+        print(f"[MEMORY] Lesson {label} written — confidence: {conf} (resolved at Level {level})")
+
+    ctx = {"language": "Python", "framework": "React", "database": "PostgreSQL"}
+    ranked = await memory.retrieve_lessons(
+        "backend_agent",
+        "Build a task creation API endpoint",
+        top_k=5,
+        current_context=ctx,
+    )
+    print('\n[MEMORY] Retrieving lessons for: "Build a task creation API endpoint"')
+    for i, item in enumerate(ranked, start=1):
+        label = item.lesson.confidence.upper()
+        extra = ""
+        if item.lesson.confidence == "medium":
+            extra = " — verify applies"
+        elif item.lesson.confidence == "low":
+            extra = " — hint only"
+        print(f"  {i}. [{label} CONFIDENCE{extra}] {item.lesson.rule}")
+
+    lesson_c = ranked[0].lesson if ranked else None
+    if lesson_c:
+        for _ in range(3):
+            await health.record_success(lesson_c.id, lesson_c.agent_role)
+        await health.record_failure(lesson_c.id, lesson_c.agent_role, "regression on edge case")
+        updated = await memory.get_lesson(lesson_c.agent_role, lesson_c.id)
+        if updated:
+            print("\n[MEMORY] Health score update for Lesson C:")
+            print(
+                f"  Successes: {updated.success_count} | Failures: {updated.fail_count} "
+                f"| Health: {updated.health_score:.2f}"
+            )
+
+    lesson_a = next((x.lesson for x in ranked if "timeout" in x.lesson.rule.lower()), None)
+    if lesson_a is None:
+        lesson_a = (await memory.list_lessons("backend_agent"))[0]
+    await health.record_failure(lesson_a.id, lesson_a.agent_role, "still failing after apply")
+    print("\n[MEMORY] Flagging Lesson A after failure...")
+    flagged = await memory.get_lesson(lesson_a.agent_role, lesson_a.id)
+    if flagged and flagged.flagged:
+        print("[MEMORY] Lesson A flagged — excluded from future results")
+
+    ts = TechStackDocument(
+        language="Python",
+        framework="React",
+        database="PostgreSQL",
+        testing_framework="pytest",
+        rationale="demo",
+    )
+    django_guards = build_context_guards(
+        TechStackDocument(
+            language="Python",
+            framework="Django",
+            database="PostgreSQL",
+            testing_framework="pytest",
+            rationale="demo",
+        )
+    )
+    lesson_d = Lesson(
+        id=new_lesson_id(),
+        agent_role="backend_agent",
+        failure_description="ORM mismatch",
+        root_cause="c",
+        resolution="r",
+        rule="Use select_related for list endpoints",
+        created_at=datetime.now(UTC),
+        project_id=pid,
+        task_id=tid,
+        context_guards=django_guards,
+    )
+    await memory.write_lesson(lesson_d)
+    filtered = await memory.retrieve_lessons(
+        "backend_agent",
+        "select_related list endpoints",
+        top_k=5,
+        current_context=build_context_guards(ts),
+    )
+    print("\n[MEMORY] Context guard test:")
+    print("  Lesson D (Django): filtered out — current framework is React")
+    print(f"  Retrieved: {len(filtered)} lessons (context-compatible only)")
+
+    prompt_block = memory.format_lessons_for_prompt(
+        ranked[:3],
+        "Build a task creation API endpoint",
+        "Personal task manager with CRUD",
+        "Python, React, PostgreSQL",
+    )
+    print("\n[MEMORY] APPLY/ADAPT/IGNORE prompt section:")
+    print(prompt_block[:600] + ("…" if len(prompt_block) > 600 else ""))
+
+
+async def _run12_confidence_and_context(
+    llm: LLMClient,
+    tm: TaskMemory,
+) -> None:
+    print("\n=== RUN 12: CONFIDENCE SCORING ===")
+    scorer = ConfidenceScorer(llm)
+    reviewer = PeerReviewer(llm)
+    task_desc = "Implement POST /tasks with validation"
+    output = "def create_task(): return {'id': 1}"
+
+    confidence = await scorer.score(
+        "demo-task-1",
+        "backend_agent_1",
+        "backend_agent",
+        task_desc,
+        output,
+    )
+    threshold = scorer.get_threshold("backend_agent")
+    needs = scorer.needs_peer_review(confidence, "backend_agent")
+    print(f"[CONFIDENCE] Backend_Agent scored output: {confidence.score}/100")
+    print(f"  Rationale: {confidence.rationale[:120]}")
+    print(f"  Threshold: {threshold} | Needs peer review: {needs}")
+
+    print("\n[CONFIDENCE] Low-confidence output simulation: 55/100")
+    low_output = "def create_task(): pass  # incomplete"
+    peer = await reviewer.review(
+        "demo-task-2",
+        task_desc,
+        low_output,
+        "backend_agent_1",
+        "peer_backend_agent_1",
+    )
+    print("  Below threshold (70) — triggering peer review...")
+    print("[PEER REVIEW] Reviewing output...")
+    print(f"  Approved: {peer.approved}")
+    print(f"  Feedback: {peer.feedback[:120]}")
+
+    ctx_mgr = ContextWindowManager(llm, tm)
+    large = "x" * 180_000
+    print("\n[CONTEXT MANAGER] Large context detected")
+    reduction = await ctx_mgr.check_and_reduce(
+        large,
+        "claude-sonnet-4-6",
+        "demo-task-ctx",
+        "backend_agent_1",
+        master_doc_section="Auth and tasks section only",
+    )
+    print(f"  Tokens before: ~{reduction.original_tokens}")
+    if reduction.strategies_used:
+        for s in reduction.strategies_used:
+            print(f"  Strategy applied: {s}")
+    print(f"  Tokens after: ~{reduction.final_tokens} | Under limit: {reduction.under_limit}")
+
+
+async def _run13_final_review(
+    session: AsyncSession,
+    llm: LLMClient,
+    memory: AgentMemory,
+    project_id: uuid.UUID,
+    master_doc: object,
+) -> None:
+    print("\n=== RUN 13: FINAL REVIEW ===")
+    lead = LeadAgent("lead_agent_1", session, llm_client=llm, agent_memory=memory)
+    print("[LEAD] Running holistic final review...")
+    result = await lead.execute_final_review(project_id, master_doc)
+    res = await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.current_state == TaskState.DONE,
+        )
+    )
+    n_done = len(list(res.scalars()))
+    print(f"[FINAL REVIEW] Checking all {n_done} completed tasks against Master_Document")
+    for check in result.consistency_checks:
+        print(f"  ✓ {check}")
+    if result.gaps_found:
+        for gap in result.gaps_found:
+            print(f"  Gap: {gap}")
+    else:
+        print("  Gaps found: 0")
+    if result.remediation_tasks:
+        print(f"  Remediation tasks created: {len(result.remediation_tasks)}")
+    else:
+        print("  Remediation tasks created: 0")
+    if result.passed:
+        print("[FINAL REVIEW] Passed — project ready for delivery")
+    else:
+        print("[FINAL REVIEW] Gaps require remediation before delivery")
+
+
 async def async_main() -> None:
     settings = get_settings()
     if not settings.anthropic_api_key.strip():
@@ -814,9 +1029,10 @@ async def async_main() -> None:
         raise SystemExit(1)
     pool = ModelPool.from_env()
     router = ModelRouter(pool)
-    llm = LLMClient(settings.anthropic_api_key, router)
-    memory = AgentMemory(settings.chroma_host, settings.chroma_port)
     tm = TaskMemory(settings.redis_url, ttl_seconds=settings.task_memory_ttl)
+    memory = AgentMemory(settings.chroma_host, settings.chroma_port)
+    llm = LLMClient(settings.anthropic_api_key, router)
+    llm.context_manager = ContextWindowManager(llm, tm)
 
     try:
         async with AsyncSessionFactory() as session:
@@ -862,6 +1078,11 @@ async def async_main() -> None:
             )
             await _run10_backend_phase_gate(
                 session, llm, memory, project_id, tm, backend_result
+            )
+            await _run11_agent_memory_upgrades(memory)
+            await _run12_confidence_and_context(llm, tm)
+            await _run13_final_review(
+                session, llm, memory, project_id, result.master_document
             )
             # Legacy Phase 6 runs (optional — uncomment to execute 4–6 as well)
             # root_react_code = await _run4_root_layout(session, llm, memory, nav, layout, project_id, tm)

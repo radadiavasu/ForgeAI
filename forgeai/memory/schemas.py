@@ -19,6 +19,17 @@ class Lesson(BaseModel):
     created_at: datetime
     project_id: str
     task_id: str
+    confidence: str = "high"
+    human_verified: bool = False
+    resolved_at_escalation_level: int = 4
+    health_score: float = 1.0
+    total_uses: int = 0
+    success_count: int = 0
+    fail_count: int = 0
+    flagged: bool = False
+    flag_reason: str = ""
+    context_guards: dict[str, str] = Field(default_factory=dict)
+    supersedes: str | None = None
 
 
 class LessonQueryResult(BaseModel):

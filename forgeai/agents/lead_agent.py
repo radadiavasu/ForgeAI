@@ -30,6 +30,7 @@ from forgeai.escalation.loop_counter import LoopCounter
 from forgeai.escalation.persistence import EscalationPersistence
 from forgeai.orchestration.phase_gate import PhaseGate
 from forgeai.orchestration.qa_loop import QAOrchestrator
+from forgeai.intelligence.schemas import FinalReviewResult
 from forgeai.orchestration.schemas import (
     BackendPhaseResult,
     DefectReport,
@@ -436,9 +437,54 @@ class LeadAgent(BaseAgent):
         escalation_ladder: EscalationLadder | None = None,
         api_contract: dict | None = None,
         task_description: str | None = None,
+        agent_role: str | None = None,
+        confidence_scorer: Any | None = None,
+        peer_reviewer: Any | None = None,
     ) -> QADecision:
         """Run QA review and approve/reject via ``QAOrchestrator``."""
         _ = page_spec
+        if (
+            confidence_scorer is not None
+            and peer_reviewer is not None
+            and task_description
+            and agent_role
+        ):
+            confidence = await confidence_scorer.score(
+                str(task_id),
+                original_agent_id,
+                agent_role,
+                task_description,
+                code,
+            )
+            if confidence_scorer.needs_peer_review(confidence, agent_role):
+                peer = await peer_reviewer.review(
+                    str(task_id),
+                    task_description,
+                    code,
+                    original_agent_id,
+                    f"peer_{agent_role}_1",
+                )
+                if not peer.approved:
+                    from datetime import UTC, datetime
+
+                    from forgeai.orchestration.schemas import DefectReport
+
+                    return QADecision(
+                        task_id=str(task_id),
+                        approved=False,
+                        defect_report=DefectReport(
+                            task_id=str(task_id),
+                            agent_id=original_agent_id,
+                            original_agent_id=original_agent_id,
+                            failure_summary="Peer review rejected before QA gate",
+                            failed_tests=[],
+                            passed_tests=[],
+                            execution_mode="peer_review",
+                            suggestions=peer.feedback,
+                            retry_count=0,
+                            created_at=datetime.now(UTC),
+                        ),
+                    )
         if loop_counter is None or escalation_ladder is None:
             loop_counter = LoopCounter()
             escalation_ladder = EscalationLadder(
@@ -776,3 +822,16 @@ class LeadAgent(BaseAgent):
             approved=False,
             feedback="Human requested additional backend changes before final review.",
         )
+
+    async def execute_final_review(
+        self,
+        project_id: uuid.UUID,
+        master_document: MasterDocument,
+    ) -> FinalReviewResult:
+        """Holistic review of DONE tasks against Master_Document (Phase 9 stub)."""
+        if self._llm_client is None:
+            raise RuntimeError("LeadAgent needs llm_client for final review")
+        from forgeai.intelligence.final_review import FinalReviewer
+
+        reviewer = FinalReviewer(self._llm_client, self.db)
+        return await reviewer.review(str(project_id), master_document)
