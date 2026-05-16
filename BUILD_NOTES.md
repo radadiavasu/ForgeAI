@@ -54,6 +54,30 @@ Applies to: any agent producing LayoutSpecification documents.
 
 ------
 
+## Phase 7 Discoveries:
+
+### 1. Deferred items show generic labels
+Phase_Completion_Report deferred items display as "Backend task 7",
+"Backend task 8" instead of actual task titles.
+Root cause: task titles not being passed correctly to report compiler.
+Fix: Phase 10 polish — ensure task titles pulled from PostgreSQL
+when compiling deferred items list.
+
+------
+
+## Phase 8 Discoveries:
+
+### 1. Docker registry TLS timeout handling
+Sandbox occasionally fails with TLS handshake timeout when Docker
+Desktop loses connectivity to registry-1.docker.io.
+System correctly treats this as a sandbox failure and retries.
+Long-term fix: pre-pull python:3.11-slim image to ensure it is
+cached locally before backend phase begins.
+Add image pre-pull step to BackendOrchestrator.run_backend_phase()
+initialisation.
+
+------
+
 ## Phase 9 Targets — Agent Memory Upgrades
 
 ### 1. Lesson confidence levels

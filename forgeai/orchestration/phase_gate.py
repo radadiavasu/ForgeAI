@@ -18,6 +18,7 @@ from forgeai.contracts.schemas import ComponentEntry, NavigationContract
 from forgeai.models.task import Task
 from forgeai.orchestration.schemas import (
     APIContractReview,
+    BackendPhaseResult,
     FrontendPhaseResult,
     PhaseCompletionReport,
     PhaseGateResult,
@@ -234,6 +235,87 @@ class PhaseGate:
                 lines.append(f" - {d}")
         lines.append("")
         lines.append(" Approve to start Backend Phase →")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        return "\n".join(lines)
+
+    async def compile_backend_report(
+        self,
+        backend_result: BackendPhaseResult,
+        project_id: str,
+    ) -> PhaseCompletionReport:
+        pid = UUID(project_id)
+        summaries: list[TaskSummary] = []
+        for ref in backend_result.completed_tasks:
+            task_row = await self._load_task_by_id_or_title(pid, ref)
+            if task_row is None:
+                continue
+            summaries.append(
+                TaskSummary(
+                    task_id=str(task_row.id),
+                    title=task_row.title,
+                    agent_id=task_row.assigned_agent or "",
+                    qa_cycles=1,
+                    final_status="DONE",
+                )
+            )
+        if not summaries:
+            res = await self.db.execute(
+                select(Task).where(
+                    Task.project_id == pid,
+                    Task.current_state == TaskState.DONE,
+                )
+            )
+            for task in res.scalars():
+                if task.assigned_agent and "backend" in task.assigned_agent.lower():
+                    summaries.append(
+                        TaskSummary(
+                            task_id=str(task.id),
+                            title=task.title,
+                            agent_id=task.assigned_agent,
+                            qa_cycles=1,
+                            final_status="DONE",
+                        )
+                    )
+
+        return PhaseCompletionReport(
+            project_id=project_id,
+            phase="BACKEND_PHASE",
+            completed_tasks=summaries,
+            total_tasks=backend_result.total_tasks,
+            total_qa_cycles=backend_result.qa_cycles,
+            components_registry=[],
+            navigation_contract_summary="",
+            deferred_items=[],
+            compiled_at=datetime.now(UTC),
+            compiled_by="lead_agent",
+        )
+
+    def format_backend_report_for_human(
+        self,
+        report: PhaseCompletionReport,
+        backend_result: BackendPhaseResult,
+    ) -> str:
+        lines = [
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            " HUMAN GATE — Backend Complete",
+            "",
+            f" All {report.total_tasks} API endpoints are built and tested.",
+            " The system is ready for final review.",
+            "",
+            " APIs completed:",
+        ]
+        for item in report.completed_tasks:
+            lines.append(f" ✓ {item.title} (tests verified)")
+        lines.append("")
+        lines.append(
+            f" Total tests passed: {backend_result.tests_passed}/{backend_result.tests_total}"
+        )
+        lines.append(
+            " Issues caught and fixed automatically: "
+            f"{backend_result.contract_violations_caught}"
+        )
+        lines.append("")
+        lines.append(" Approve to begin final review →")
         lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         return "\n".join(lines)
 

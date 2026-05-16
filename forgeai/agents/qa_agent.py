@@ -12,6 +12,7 @@ from forgeai.exceptions import SandboxProvisionError, SandboxTimeoutError, SelfA
 from forgeai.models.task import Task
 from forgeai.sandbox.frontend_sandbox import FrontendSandbox
 from forgeai.sandbox.runner import TestRunner
+from forgeai.orchestration.backend_orchestrator import ContractValidator
 from forgeai.sandbox.schemas import RunnerOutput
 from forgeai.state_machine.machine import TaskStateMachine
 from forgeai.state_machine.states import TaskState
@@ -66,11 +67,13 @@ class QAAgent(BaseAgent):
         task_memory: TaskMemory | None = None,
         llm_client: LLMClient | None = None,
         frontend_sandbox: FrontendSandbox | None = None,
+        contract_validator: ContractValidator | None = None,
     ) -> None:
         super().__init__(agent_id, db_session, task_memory=task_memory)
         self.test_runner = test_runner
         self.llm = llm_client
         self.frontend_sandbox = frontend_sandbox
+        self.contract_validator = contract_validator
 
     async def begin_review(self, task_id: uuid.UUID) -> Task:
         """Transition ``IN_REVIEW`` → ``TESTING``."""
@@ -87,11 +90,37 @@ class QAAgent(BaseAgent):
         code: str,
         test_code: str,
         development_phase: str = "BACKEND_PHASE",
+        *,
+        api_contract: dict | None = None,
+        task_description: str | None = None,
     ) -> RunnerOutput:
         """Run sandbox tests after enforcing no self-approval."""
         await self._assert_not_self_approval(task_id)
         if development_phase == "FRONTEND_PHASE":
             return await self._run_playwright(code, test_code)
+        if (
+            development_phase == "BACKEND_PHASE"
+            and api_contract
+            and self.contract_validator is not None
+        ):
+            validation = await self.contract_validator.validate(
+                code,
+                api_contract,
+                task_description or "",
+            )
+            if not validation.valid and validation.severity == "blocking":
+                violation_text = "\n".join(validation.violations)
+                return RunnerOutput(
+                    success=False,
+                    total_tests=0,
+                    passed_tests=0,
+                    failed_tests=1,
+                    test_cases=[],
+                    stdout="",
+                    stderr=violation_text,
+                    execution_time_seconds=0.0,
+                    sandbox_error="API contract violation: " + ", ".join(validation.violations),
+                )
         if self.test_runner is None:
             raise RuntimeError("QAAgent requires a TestRunner for review()")
         return await self.test_runner.run(code=code, test_code=test_code)

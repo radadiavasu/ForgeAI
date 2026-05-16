@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import uuid
+from typing import Any
 
 from sqlalchemy import select
 
@@ -14,24 +16,66 @@ from forgeai.models.task import Task
 from forgeai.memory.agent_memory import AgentMemory
 from forgeai.state_machine.machine import TaskStateMachine
 from forgeai.state_machine.states import TaskState
-from forgeai.state_machine.transitions import KEY_WORK_OUTPUT
+from forgeai.state_machine.transitions import KEY_METADATA, KEY_WORK_OUTPUT
 
 logger = logging.getLogger(__name__)
 
 BACKEND_ROLE_PROMPT = """
 You are Backend_Agent. Implement the assigned task as Python application code suitable
 for a module named main.py in a sandbox. Prefer clear functions and minimal dependencies.
-Output only the Python source code for main.py (no markdown fences unless wrapping code).
-If tests expect specific function names, implement exactly what the task asks for.
+
+When an API_Contract is provided, your implementation is bound by it. The endpoint path,
+HTTP method, request schema, and response schema are not suggestions — they are the
+contract. QA_Agent will validate your output against the contract. Any deviation will be
+rejected as a defect.
+
+Output JSON with fields:
+- "code": complete Python source for main.py
+- "test_code": pytest module that imports from main and validates behaviour
+
+If you cannot emit JSON, output only the Python source for main.py.
 """.strip()
 
 
-def _extract_code_from_response(text: str) -> str:
+def _strip_json_fence(raw: str) -> str:
+    s = raw.strip()
+    if s.startswith("```"):
+        lines = s.split("\n")
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        s = "\n".join(lines)
+    return s.strip()
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    s = _strip_json_fence(text)
+    try:
+        out = json.loads(s)
+        return out if isinstance(out, dict) else {"raw": out}
+    except json.JSONDecodeError:
+        m = re.search(r"\{[\s\S]*\}", s)
+        if m:
+            out = json.loads(m.group(0))
+            return out if isinstance(out, dict) else {"raw": out}
+        raise
+
+
+def _extract_code_from_response(text: str) -> tuple[str, str]:
     t = text.strip()
+    try:
+        data = _extract_json_object(t)
+        code = str(data.get("code", "")).strip()
+        test_code = str(data.get("test_code", "")).strip()
+        if code:
+            return code, test_code
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
     m = re.search(r"```(?:python)?\s*\n([\s\S]*?)```", t)
     if m:
-        return m.group(1).strip()
-    return t
+        return m.group(1).strip(), ""
+    return t, ""
 
 
 class BackendAgent(BaseAgent):
@@ -57,6 +101,7 @@ class BackendAgent(BaseAgent):
         *,
         task_description: str | None = None,
         master_document_section: str | None = None,
+        api_contract: dict | None = None,
         loop_count: int = 0,
         output: str | None = None,
     ) -> Task:
@@ -90,9 +135,18 @@ class BackendAgent(BaseAgent):
         lesson_lines = [f"- {x.lesson.rule}" for x in ranked[:5]]
         lessons_block = "\n".join(lesson_lines) if lesson_lines else "(no prior lessons)"
         system_prompt = f"{BACKEND_ROLE_PROMPT}\n\nRelevant past lessons:\n{lessons_block}"
+        contract_block = ""
+        if api_contract:
+            contract_block = (
+                "\n\nAPI_Contract (must match exactly):\n"
+                f"{json.dumps(api_contract, indent=2)}\n\n"
+                "Your implementation must exactly match the API_Contract endpoint, method, "
+                "request schema, and response schema. Any deviation is a defect."
+            )
         user_message = (
             f"Task:\n{task_description}\n\n"
             f"Master document context:\n{master_document_section}\n"
+            f"{contract_block}"
         )
 
         logger.info(
@@ -107,14 +161,21 @@ class BackendAgent(BaseAgent):
             loop_count=loop_count,
             max_tokens=8192,
         )
-        code = _extract_code_from_response(resp.content)
+        code, test_code = _extract_code_from_response(resp.content)
         lines = len(code.splitlines())
         logger.info("[BACKEND] Code generated — %s lines", lines)
 
+        metadata: dict[str, Any] = {}
+        if test_code:
+            metadata["test_code"] = test_code
+
         machine = TaskStateMachine(self.db, task_memory=self.task_memory)
+        kwargs: dict[str, Any] = {KEY_WORK_OUTPUT: code}
+        if metadata:
+            kwargs[KEY_METADATA] = metadata
         return await machine.transition(
             task_id,
             TaskState.IN_REVIEW,
             self.agent_id,
-            **{KEY_WORK_OUTPUT: code},
+            **kwargs,
         )

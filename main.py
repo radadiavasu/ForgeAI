@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from forgeai.agents.backend_agent import BackendAgent
 from forgeai.agents.frontend_agent import FrontendAgent
 from forgeai.agents.lead_agent import LeadAgent
 from forgeai.agents.qa_agent import QAAgent
@@ -30,6 +31,9 @@ from forgeai.llm.schemas import ModelPool
 from forgeai.memory.agent_memory import AgentMemory
 from forgeai.memory.task_memory import TaskMemory
 from forgeai.models.task import Task, TaskComplexity
+from forgeai.orchestration.backend_orchestrator import BackendOrchestrator, ContractValidator
+from forgeai.orchestration.qa_loop import QAOrchestrator
+from forgeai.orchestration.schemas import FrontendPhaseResult
 from forgeai.sandbox.frontend_sandbox import FrontendSandbox
 from forgeai.sandbox.runner import TestRunner
 from forgeai.sandbox.sandbox import Sandbox, SandboxConfig
@@ -124,6 +128,11 @@ async def auto_approve(rec) -> ApprovedConfig:
 
 async def auto_approve_gate(_summary: str) -> bool:
     print("[GATE] Human approved — starting Backend Phase")
+    return True
+
+
+async def auto_approve_backend_gate(_summary: str) -> bool:
+    print("[GATE] Human approved — advancing to FINAL_REVIEW")
     return True
 
 
@@ -656,8 +665,6 @@ async def _run8_human_gate(
         )
     )
     done_ids = [str(t.id) for t in res.scalars()]
-    from forgeai.orchestration.schemas import FrontendPhaseResult
-
     fe_result = FrontendPhaseResult(
         project_id=str(project_id),
         completed_tasks=done_ids,
@@ -685,6 +692,7 @@ async def _run8_human_gate(
     )
     if not gate_result.api_contract_updated:
         print("[LEAD] API_Contract — no changes required")
+    await lead.write_to_project_memory("api_contract", api_contract, project_id=project_id)
     unlocked = await session.execute(
         select(Task).where(
             Task.project_id == project_id,
@@ -695,6 +703,108 @@ async def _run8_human_gate(
     print("[LEAD] Unlocking backend tasks...")
     print(f"[LEAD] {n_unlocked} backend tasks: Phase_Locked → TODO")
     print("[LEAD] BACKEND_PHASE starting")
+
+
+async def _load_api_contract(session: AsyncSession, project_id: uuid.UUID) -> dict:
+    from forgeai.models.project_artefact import ProjectArtefactModel
+
+    row = (
+        await session.execute(
+            select(ProjectArtefactModel).where(
+                ProjectArtefactModel.project_id == project_id,
+                ProjectArtefactModel.artefact_type == "api_contract",
+                ProjectArtefactModel.is_current.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if row and isinstance(row.content, dict):
+        return row.content
+    return {
+        "endpoints": [
+            {"method": "GET", "path": "/tasks", "response": {"fields": ["id", "title", "created_at"]}},
+            {"method": "POST", "path": "/tasks", "response": {"fields": ["id", "title", "created_at"]}},
+        ]
+    }
+
+
+async def _run9_full_backend_phase(
+    session: AsyncSession,
+    llm: LLMClient,
+    memory: AgentMemory,
+    project_id: uuid.UUID,
+    tm: TaskMemory,
+    api_contract: dict,
+) -> object:
+    print("\n=== RUN 9: FULL BACKEND PHASE ===")
+    lead = LeadAgent("lead_agent_1", session, task_memory=tm, llm_client=llm, agent_memory=memory)
+    loop_counter = LoopCounter()
+    ladder = EscalationLadder(loop_counter, EscalationPersistence(session))
+    sm = TaskStateMachine(session, task_memory=tm)
+    qa_orch = QAOrchestrator(sm, loop_counter, ladder, llm, session, task_memory=tm)
+    validator = ContractValidator(llm)
+    backend = BackendAgent(
+        "backend_agent_1",
+        session,
+        task_memory=tm,
+        llm_client=llm,
+        agent_memory=memory,
+    )
+    qa = QAAgent(
+        "qa_agent_1",
+        session,
+        test_runner=_make_runner(TaskComplexity.MEDIUM),
+        task_memory=tm,
+        llm_client=llm,
+        contract_validator=validator,
+    )
+    orch = BackendOrchestrator(
+        lead,
+        backend,
+        qa,
+        qa_orch,
+        validator,
+        session,
+        loop_counter=loop_counter,
+        escalation_ladder=ladder,
+    )
+    print("[BACKEND] Reading API_Contract from Project_Memory...")
+    res = await session.execute(
+        select(Task).where(
+            Task.project_id == project_id,
+            Task.current_state == TaskState.TODO,
+        )
+    )
+    todo_backend = [
+        t for t in res.scalars() if t.assigned_agent and "backend" in t.assigned_agent.lower()
+    ]
+    total = len(todo_backend)
+    for idx, task in enumerate(todo_backend, start=1):
+        print(f"\n[BACKEND] Processing task {idx}/{total}: {task.title}")
+        print("[BACKEND] Generating implementation (claude-sonnet-4-6)...")
+    result = await orch.run_backend_phase(str(project_id), api_contract)
+    print("\n[BACKEND] All %d tasks complete" % result.total_tasks)
+    print("[BACKEND] Summary:")
+    print(f"  Total tasks: {result.total_tasks}")
+    print(f"  QA cycles: {result.qa_cycles}")
+    print(f"  Contract violations caught: {result.contract_violations_caught}")
+    print(f"  Escalations: {result.escalations}")
+    print(f"  Time: {result.phase_duration_seconds:.1f}s")
+    return result
+
+
+async def _run10_backend_phase_gate(
+    session: AsyncSession,
+    llm: LLMClient,
+    memory: AgentMemory,
+    project_id: uuid.UUID,
+    tm: TaskMemory,
+    backend_result: object,
+) -> None:
+    print("\n=== RUN 10: BACKEND PHASE GATE ===")
+    lead = LeadAgent("lead_agent_1", session, task_memory=tm, llm_client=llm, agent_memory=memory)
+    print("[LEAD] Compiling backend Phase_Completion_Report...")
+    await lead.execute_backend_gate(backend_result, project_id, auto_approve_backend_gate)
+    print("[LEAD] Phase: BACKEND_PHASE → FINAL_REVIEW")
 
 
 async def async_main() -> None:
@@ -743,8 +853,15 @@ async def async_main() -> None:
             _nav, qa_cycles = await _run7_full_frontend_qa_loop(
                 session, llm, memory, nav, layout, project_id, tm
             )
+            api_contract = await _load_api_contract(session, project_id)
             await _run8_human_gate(
                 session, llm, memory, _nav, layout, project_id, tm, qa_cycles
+            )
+            backend_result = await _run9_full_backend_phase(
+                session, llm, memory, project_id, tm, api_contract
+            )
+            await _run10_backend_phase_gate(
+                session, llm, memory, project_id, tm, backend_result
             )
             # Legacy Phase 6 runs (optional — uncomment to execute 4–6 as well)
             # root_react_code = await _run4_root_layout(session, llm, memory, nav, layout, project_id, tm)

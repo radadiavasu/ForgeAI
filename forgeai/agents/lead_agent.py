@@ -8,6 +8,7 @@ import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel as PydanticBaseModel
@@ -30,6 +31,7 @@ from forgeai.escalation.persistence import EscalationPersistence
 from forgeai.orchestration.phase_gate import PhaseGate
 from forgeai.orchestration.qa_loop import QAOrchestrator
 from forgeai.orchestration.schemas import (
+    BackendPhaseResult,
     DefectReport,
     FrontendPhaseResult,
     PhaseGateResult,
@@ -432,6 +434,8 @@ class LeadAgent(BaseAgent):
         page_spec: PageSpec | None = None,
         loop_counter: LoopCounter | None = None,
         escalation_ladder: EscalationLadder | None = None,
+        api_contract: dict | None = None,
+        task_description: str | None = None,
     ) -> QADecision:
         """Run QA review and approve/reject via ``QAOrchestrator``."""
         _ = page_spec
@@ -447,13 +451,25 @@ class LeadAgent(BaseAgent):
             code=code,
             test_code=test_code,
             development_phase=development_phase,
+            api_contract=api_contract,
+            task_description=task_description,
         )
-        return await orchestrator.process_result(
+        contract_violation = (runner_output.sandbox_error or "").startswith(
+            "API contract violation"
+        )
+        decision = await orchestrator.process_result(
             str(task_id),
             runner_output,
             qa_agent.agent_id,
             original_agent_id,
             development_phase,
+        )
+        return decision.model_copy(
+            update={
+                "contract_violation": contract_violation and not decision.approved,
+                "tests_passed": runner_output.passed_tests,
+                "tests_total": runner_output.total_tests,
+            }
         )
 
     async def handle_qa_rejection(
@@ -713,3 +729,50 @@ class LeadAgent(BaseAgent):
             development_phase="FRONTEND_PHASE",
         )
         return [task]
+
+    async def _set_phase(self, phase: str, project_id: uuid.UUID) -> None:
+        await self.write_to_project_memory(
+            "current_phase",
+            {"phase": phase},
+            project_id=project_id,
+        )
+        await self.log_agent_lifecycle_event(
+            agent_id=self.agent_id,
+            agent_role="lead_agent",
+            event_type="phase_transition",
+            created_by=self.agent_id,
+            project_id=project_id,
+            development_phase=phase,
+        )
+        logger.info("[LEAD] Phase set to %s for project %s", phase, project_id)
+
+    async def execute_backend_gate(
+        self,
+        backend_result: BackendPhaseResult,
+        project_id: uuid.UUID,
+        human_approval_callback: Callable[[str], Awaitable[bool]],
+    ) -> PhaseGateResult:
+        """Compile backend report, present human gate, advance to FINAL_REVIEW."""
+        if self._llm_client is None:
+            raise RuntimeError("LeadAgent needs llm_client for backend gate")
+        phase_gate = PhaseGate(self, self._llm_client, self.db)
+        report = await phase_gate.compile_backend_report(backend_result, str(project_id))
+        formatted = phase_gate.format_backend_report_for_human(report, backend_result)
+        print(formatted)
+        approved = await human_approval_callback(formatted)
+        if approved:
+            result = PhaseGateResult(approved=True, approved_at=datetime.now(UTC))
+            await self._set_phase("FINAL_REVIEW", project_id)
+            await self.log_agent_lifecycle_event(
+                agent_id=self.agent_id,
+                agent_role="lead_agent",
+                event_type="backend_gate_approved",
+                created_by=self.agent_id,
+                project_id=project_id,
+                development_phase="FINAL_REVIEW",
+            )
+            return result
+        return PhaseGateResult(
+            approved=False,
+            feedback="Human requested additional backend changes before final review.",
+        )

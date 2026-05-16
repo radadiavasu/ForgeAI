@@ -29,6 +29,27 @@ class QADecision(BaseModel):
     defect_report: DefectReport | None = None
     escalated: bool = False
     escalation_result: EscalationResult | None = None
+    contract_violation: bool = False
+    tests_passed: int = 0
+    tests_total: int = 0
+
+
+class ContractValidationResult(BaseModel):
+    valid: bool
+    violations: list[str] = Field(default_factory=list)
+    severity: str = "blocking"  # blocking | warning
+
+
+class BackendPhaseResult(BaseModel):
+    project_id: str
+    completed_tasks: list[str] = Field(default_factory=list)
+    total_tasks: int
+    qa_cycles: int = 0
+    contract_violations_caught: int = 0
+    escalations: int = 0
+    phase_duration_seconds: float = 0.0
+    tests_passed: int = 0
+    tests_total: int = 0
 
 
 class FrontendPhaseResult(BaseModel):
