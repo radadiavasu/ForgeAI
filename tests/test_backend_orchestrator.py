@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import select
@@ -396,3 +396,26 @@ async def test_phase_advances_to_final_review_after_gate_approval(
         )
     ).scalar_one()
     assert row.content.get("phase") == "FINAL_REVIEW"
+
+
+@pytest.mark.asyncio
+async def test_run_backend_phase_prepulls_sandbox_image(
+    db_session: AsyncSession,
+    mock_llm: AsyncMock,
+    mock_runner: MagicMock,
+    task_memory: TaskMemory,
+) -> None:
+    mock_llm.complete.side_effect = [
+        _llm(_backend_code()),
+        _llm(_validation_json(valid=True)),
+    ]
+    project_id = uuid.uuid4()
+    await _create_backend_tasks(db_session, project_id, count=1)
+    orch = _build_orchestrator(db_session, mock_llm, mock_runner, task_memory)
+    with patch.object(
+        BackendOrchestrator,
+        "_prepull_sandbox_image",
+        new=AsyncMock(),
+    ) as prepull:
+        await orch.run_backend_phase(str(project_id), _contract())
+        prepull.assert_awaited_once()

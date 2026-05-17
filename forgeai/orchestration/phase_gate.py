@@ -115,7 +115,7 @@ class PhaseGate:
             summaries.append(
                 TaskSummary(
                     task_id=str(task.id),
-                    title=task.title,
+                    title=await self._task_display_title(task),
                     agent_id=task.assigned_agent,
                     qa_cycles=1,
                     final_status="DONE",
@@ -128,7 +128,7 @@ class PhaseGate:
                     summaries.append(
                         TaskSummary(
                             task_id=str(task_row.id),
-                            title=task_row.title,
+                            title=await self._task_display_title(task_row),
                             agent_id=task_row.assigned_agent,
                             qa_cycles=1,
                             final_status="DONE",
@@ -137,7 +137,7 @@ class PhaseGate:
 
         components = await component_registry.list_all(project_id)
         nav_summary = self._summarize_navigation(navigation_contract)
-        deferred = await self._deferred_frontend_items(pid, summaries)
+        deferred = await self._deferred_items_for_project(pid, summaries)
 
         return PhaseCompletionReport(
             project_id=project_id,
@@ -163,11 +163,26 @@ class PhaseGate:
             )
             return res.scalar_one_or_none()
 
-    async def _deferred_frontend_items(
+    async def _task_display_title(self, task: Task) -> str:
+        """Return PostgreSQL task title; prefer description over placeholder labels."""
+        title = (task.title or "").strip()
+        desc = (task.description or "").strip()
+        if re.match(r"^Backend task \d+$", title, re.I) and desc:
+            return desc[:120]
+        return title or str(task.id)
+
+    async def _resolve_title_by_ref(self, project_id: UUID, ref: str) -> str:
+        row = await self._load_task_by_id_or_title(project_id, ref)
+        if row is not None:
+            return await self._task_display_title(row)
+        return ref
+
+    async def _deferred_items_for_project(
         self,
         project_id: UUID,
         completed: list[TaskSummary],
     ) -> list[str]:
+        completed_ids = {s.task_id for s in completed}
         completed_titles = {s.title for s in completed}
         res = await self.db.execute(
             select(Task).where(
@@ -175,12 +190,15 @@ class PhaseGate:
                 Task.current_state != TaskState.DONE,
             )
         )
-        return [
-            t.title
-            for t in res.scalars()
-            if "FRONTEND" in (t.title or "").upper() or t.current_state == TaskState.PHASE_LOCKED
-            if t.title not in completed_titles
-        ]
+        deferred: list[str] = []
+        for task in res.scalars():
+            if str(task.id) in completed_ids:
+                continue
+            display = await self._task_display_title(task)
+            if display in completed_titles:
+                continue
+            deferred.append(display)
+        return deferred
 
     def _summarize_navigation(self, navigation_contract: NavigationContract) -> str:
         parts = [
@@ -252,7 +270,7 @@ class PhaseGate:
             summaries.append(
                 TaskSummary(
                     task_id=str(task_row.id),
-                    title=task_row.title,
+                    title=await self._task_display_title(task_row),
                     agent_id=task_row.assigned_agent or "",
                     qa_cycles=1,
                     final_status="DONE",
@@ -270,12 +288,14 @@ class PhaseGate:
                     summaries.append(
                         TaskSummary(
                             task_id=str(task.id),
-                            title=task.title,
+                            title=await self._task_display_title(task),
                             agent_id=task.assigned_agent,
                             qa_cycles=1,
                             final_status="DONE",
                         )
                     )
+
+        deferred = await self._deferred_items_for_project(pid, summaries)
 
         return PhaseCompletionReport(
             project_id=project_id,
@@ -285,7 +305,7 @@ class PhaseGate:
             total_qa_cycles=backend_result.qa_cycles,
             components_registry=[],
             navigation_contract_summary="",
-            deferred_items=[],
+            deferred_items=deferred,
             compiled_at=datetime.now(UTC),
             compiled_by="lead_agent",
         )

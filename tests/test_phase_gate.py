@@ -255,3 +255,27 @@ async def test_execute_human_gate_unlocks_backend(db_session: AsyncSession) -> N
 
 async def _async_true() -> bool:
     return True
+
+
+@pytest.mark.asyncio
+async def test_deferred_items_use_description_not_placeholder_title(
+    db_session: AsyncSession,
+) -> None:
+    lead = LeadAgent("lead_1", db_session)
+    gate = PhaseGate(lead, AsyncMock(), db_session)
+    project_id = uuid.uuid4()
+    await lead.create_task(
+        "Backend task 7",
+        "Implement user settings API",
+        TaskComplexity.LOW,
+        "backend_agent_1",
+        project_id=project_id,
+    )
+    report = await gate.compile_report(
+        _frontend_result(str(project_id), []),
+        ComponentRegistry(db_session),
+        _nav_contract(str(project_id)),
+        str(project_id),
+    )
+    assert "Implement user settings API" in report.deferred_items
+    assert "Backend task 7" not in report.deferred_items

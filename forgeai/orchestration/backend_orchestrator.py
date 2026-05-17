@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import subprocess
 import time
 import uuid
 from typing import TYPE_CHECKING, Any
@@ -175,6 +177,30 @@ class BackendOrchestrator:
             )
         self.escalation_ladder = escalation_ladder
 
+    async def _prepull_sandbox_image(self) -> None:
+        """Cache python:3.11-slim before backend tasks run."""
+
+        def _pull() -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["docker", "pull", "python:3.11-slim"],
+                capture_output=True,
+                text=True,
+            )
+
+        logger.info("Pre-pulling sandbox image python:3.11-slim")
+        try:
+            proc = await asyncio.to_thread(_pull)
+            if proc.returncode != 0:
+                logger.warning(
+                    "Sandbox image pre-pull failed (image may already exist): %s",
+                    (proc.stderr or proc.stdout or "").strip(),
+                )
+        except Exception as exc:
+            logger.warning(
+                "Sandbox image pre-pull failed (image may already exist): %s",
+                exc,
+            )
+
     async def run_backend_phase(
         self,
         project_id: str,
@@ -182,6 +208,7 @@ class BackendOrchestrator:
         *,
         master_document_section: str = "",
     ) -> BackendPhaseResult:
+        await self._prepull_sandbox_image()
         started = time.monotonic()
         pid = uuid.UUID(project_id)
         res = await self.db.execute(

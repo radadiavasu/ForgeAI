@@ -144,3 +144,60 @@ async def test_human_message_no_jargon(db_session: AsyncSession) -> None:
     lower = impact.human_message.lower()
     for word in _JARGON:
         assert word not in lower, f"found jargon: {word}"
+
+
+@pytest.mark.asyncio
+async def test_calibrated_cost_for_large_feature(db_session: AsyncSession) -> None:
+    mock_llm = AsyncMock()
+    mock_llm.complete.return_value = LLMResponse(
+        content=json.dumps(
+            {
+                "affected_task_titles": ["Complete task endpoint"],
+                "conflicting_task_titles": [],
+                "new_tasks_required": ["Team sharing UI"],
+                "estimated_cost_usd": 9500.0,
+                "estimated_time_minutes": 9999,
+            }
+        ),
+        model_used="m",
+        input_tokens=1,
+        output_tokens=1,
+        estimated_cost_usd=0.0,
+    )
+    from forgeai.lifecycle.schemas import ChangeClassification
+
+    classification = ChangeClassification(
+        change_type=ChangeType.LARGE_FEATURE,
+        risk_level=RiskLevel.HIGH,
+        reasoning="large",
+        requires_human_confirmation=True,
+    )
+    lead = LeadAgent("lead_1", db_session)
+    project_id = uuid.uuid4()
+    task = await lead.create_task(
+        "Complete task endpoint",
+        None,
+        TaskComplexity.LOW,
+        "backend_agent_1",
+        project_id=project_id,
+    )
+    await lead.approve_phase_transition(task.id)
+    sm = TaskStateMachine(db_session)
+    await sm.transition(task.id, TaskState.IN_PROGRESS, "backend_agent_1")
+    await sm.transition(
+        task.id,
+        TaskState.IN_REVIEW,
+        "backend_agent_1",
+        **{KEY_WORK_OUTPUT: "code"},
+    )
+    await sm.transition(task.id, TaskState.TESTING, "qa_1")
+    await sm.transition(task.id, TaskState.DONE, "qa_1", **{KEY_OUTPUT: "ok"})
+
+    impact = await ImpactAnalyser(mock_llm, db_session).analyse(
+        "add teams",
+        classification,
+        str(project_id),
+        _master(),
+    )
+    assert impact.estimated_cost_usd == pytest.approx(0.45, rel=0.01)
+    assert impact.estimated_time_minutes == 54

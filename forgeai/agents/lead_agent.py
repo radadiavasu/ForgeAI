@@ -837,6 +837,147 @@ class LeadAgent(BaseAgent):
         reviewer = FinalReviewer(self._llm_client, self.db)
         return await reviewer.review(str(project_id), master_document)
 
+    async def deliver_project(
+        self,
+        project_id: str,
+        output_dir: str,
+        human_approval_callback: Callable[[str], Awaitable[bool]],
+        *,
+        master_document: MasterDocument | None = None,
+        tech_stack_document: TechStackDocument | None = None,
+        qa_agent: QAAgent | None = None,
+    ):
+        """Final review, assemble deployment package, and transition to LIVE on approval."""
+        from pathlib import Path
+
+        from forgeai.delivery.git_manager import GitManager
+        from forgeai.delivery.package_assembler import PackageAssembler, DEFAULT_OUTPUT_ROOT
+        from forgeai.delivery.schemas import DeploymentPackage
+        from forgeai.lifecycle.project_registry import ProjectRegistry
+        from forgeai.models.project_artefact import ProjectArtefactModel
+
+        if self._llm_client is None:
+            raise RuntimeError("LeadAgent needs llm_client for deliver_project")
+
+        pid = uuid.UUID(project_id)
+        master = master_document
+        tech = tech_stack_document
+        if master is None or tech is None:
+            for artefact_type, target in (
+                ("master_document", "master"),
+                ("tech_stack_document", "tech"),
+            ):
+                row = (
+                    await self.db.execute(
+                        select(ProjectArtefactModel).where(
+                            ProjectArtefactModel.project_id == pid,
+                            ProjectArtefactModel.artefact_type == artefact_type,
+                            ProjectArtefactModel.is_current.is_(True),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if row is None:
+                    continue
+                if target == "master":
+                    master = MasterDocument.model_validate(row.content)
+                else:
+                    tech = TechStackDocument.model_validate(row.content)
+        if master is None or tech is None:
+            raise RuntimeError("deliver_project requires master and tech stack documents")
+
+        print("[DELIVERY] Running final review...")
+        review = await self.execute_final_review(pid, master)
+        n_checked = len(review.consistency_checks)
+        if review.gaps_found:
+            print(f"[FINAL REVIEW] {n_checked} tasks checked — gaps found")
+            for gap in review.gaps_found:
+                print(f"  Gap: {gap}")
+            for title in review.remediation_tasks:
+                await self.create_task(
+                    title=title[:512],
+                    description=title,
+                    complexity=TaskComplexity.MEDIUM,
+                    assigned_agent="frontend_agent_1",
+                    project_id=pid,
+                )
+        else:
+            print(f"[FINAL REVIEW] {n_checked} tasks checked — no gaps ✓")
+
+        out_path = Path(output_dir) if output_dir else DEFAULT_OUTPUT_ROOT / project_id
+        git = GitManager(str(out_path))
+        qa = qa_agent or QAAgent(
+            "qa_delivery",
+            self.db,
+            llm_client=self._llm_client,
+        )
+        assembler = PackageAssembler(
+            self.db,
+            git,
+            qa,
+            self._llm_client,
+            lead_agent=self,
+        )
+        print("[DELIVERY] Assembling Deployment_Package...")
+        package = await assembler.assemble(
+            project_id,
+            master,
+            tech,
+            str(out_path),
+            project_brief=master.project_summary,
+        )
+
+        print("")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(" DELIVERY READY")
+        print("")
+        print(" Your project is packaged and ready to deploy.")
+        print("")
+        print(f" Location: {package.output_dir}")
+        print(f" Git tag: {package.release_tag}")
+        build_label = "verified ✓" if package.docker_build_passed else "failed"
+        print(f" Docker build: {build_label}")
+        print("")
+        print(" To deploy:")
+        print(f"   cd {out_path.name}")
+        print("   cp .env.example .env")
+        print("   docker compose up")
+        print("")
+        print(" Approve delivery →")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+        summary = (
+            f"Deliver {master.project_name} to LIVE? "
+            f"Package at {package.output_dir}"
+        )
+        approved = await human_approval_callback(summary)
+        if approved:
+            print("[DELIVERY] Human approved")
+            registry = ProjectRegistry(self.db)
+            try:
+                await registry.set_live(project_id, package.release_tag)
+                print("[REGISTRY] Project: ACTIVE → LIVE")
+            except ValueError:
+                project = await registry.get_project(project_id)
+                if project is not None and project.status.value == "LIVE":
+                    print("[REGISTRY] Project already LIVE")
+                else:
+                    raise
+            await self.log_agent_lifecycle_event(
+                agent_id=self.agent_id,
+                agent_role="lead_agent",
+                event_type="delivery_approved",
+                created_by=self.agent_id,
+                project_id=pid,
+                development_phase="LIVE",
+            )
+        print("[DELIVERY] Package complete")
+        print("")
+        print("--- FINAL SUMMARY ---")
+        print(f"Project: {master.project_name}")
+        print(f"Tasks completed: {package.git_log and len(package.files_written) or 0}")
+        print(f"Release: {package.release_tag}")
+        return package
+
     async def enter_live_mode(self, project_id: uuid.UUID, release_tag: str) -> None:
         """Destroy execution agents and transition project to LIVE dormancy."""
         from forgeai.lifecycle.project_registry import ProjectRegistry

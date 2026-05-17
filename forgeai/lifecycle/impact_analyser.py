@@ -11,7 +11,7 @@ from uuid import UUID
 from pydantic import ValidationError
 from sqlalchemy import select
 
-from forgeai.lifecycle.schemas import ChangeClassification, ImpactAnalysis
+from forgeai.lifecycle.schemas import ChangeClassification, ChangeType, ImpactAnalysis
 from forgeai.llm.client import LLMClient
 from forgeai.llm.schemas import MasterDocument
 from forgeai.models.task import Task
@@ -90,13 +90,34 @@ def _plain_risk_label(classification: ChangeClassification) -> str:
     return labels.get(classification.risk_level.value, classification.risk_level.value)
 
 
+def _calibrated_estimates(
+    classification: ChangeClassification,
+    affected_count: int,
+    new_count: int,
+) -> tuple[float, int | str]:
+    """Cost (USD) and time (minutes or assessment message) from Phase 8–9B calibration."""
+    ct = classification.change_type
+    if ct == ChangeType.ARCHITECTURAL:
+        return 0.0, "Requires assessment"
+    if ct == ChangeType.BUGFIX:
+        return affected_count * 0.05, affected_count * 5
+    if ct == ChangeType.SMALL_FEATURE:
+        total = affected_count + new_count
+        return total * 0.08, total * 8
+    if ct == ChangeType.LARGE_FEATURE:
+        total = affected_count + new_count
+        return 0.25 + total * 0.10, 30 + total * 12
+    total = affected_count + new_count
+    return total * 0.08, total * 8
+
+
 def format_human_message(
     classification: ChangeClassification,
     affected_count: int,
     conflicting_count: int,
     new_count: int,
     cost: float,
-    minutes: int,
+    minutes: int | str,
 ) -> str:
     lines = [
         "This change request affects your project as follows:",
@@ -109,15 +130,31 @@ def format_human_message(
         f"  {conflicting_count} tasks currently in progress will be interrupted",
         f"  {new_count} new tasks will be created",
         "",
-        f"Estimated additional cost: ~${cost:.2f}",
-        f"Estimated additional time: ~{minutes} minutes",
-        "",
-        "What would you like to do?",
-        "  PROCEED — start immediately",
-        "  QUEUE   — complete current tasks first, then start",
-        "  DEFER   — implement when current phase completes",
-        "  REJECT  — do not implement this change",
     ]
+    if classification.change_type == ChangeType.ARCHITECTURAL:
+        lines.extend(
+            [
+                "Estimated additional cost: Requires assessment — contact your team",
+                "Estimated additional time: Requires assessment",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                f"Estimated additional cost: ~${cost:.2f}",
+                f"Estimated additional time: ~{minutes} minutes",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "What would you like to do?",
+            "  PROCEED — start immediately",
+            "  QUEUE   — complete current tasks first, then start",
+            "  DEFER   — implement when current phase completes",
+            "  REJECT  — do not implement this change",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -201,13 +238,20 @@ class ImpactAnalyser:
             title_to_id[t] for t in raw["conflicting_task_titles"] if t in title_to_id
         ]
 
+        cost_usd, time_est = _calibrated_estimates(
+            classification,
+            len(affected_ids),
+            len(raw["new_tasks_required"]),
+        )
+        time_minutes = 0 if isinstance(time_est, str) else int(time_est)
+
         human_message = format_human_message(
             classification,
             len(affected_ids),
             len(conflicting_ids),
             len(raw["new_tasks_required"]),
-            raw["estimated_cost_usd"],
-            raw["estimated_time_minutes"],
+            cost_usd,
+            time_est,
         )
 
         return ImpactAnalysis(
@@ -218,8 +262,8 @@ class ImpactAnalyser:
             affected_task_titles=affected_titles,
             conflicting_task_ids=conflicting_ids,
             new_tasks_required=raw["new_tasks_required"],
-            estimated_cost_usd=raw["estimated_cost_usd"],
-            estimated_time_minutes=raw["estimated_time_minutes"],
+            estimated_cost_usd=cost_usd,
+            estimated_time_minutes=time_minutes,
             human_message=human_message,
             analysed_at=datetime.now(UTC),
         )

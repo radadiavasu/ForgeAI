@@ -1037,6 +1037,50 @@ async def _scope_approve(_spec: object) -> bool:
     return True
 
 
+async def auto_approve_delivery(_summary: str) -> bool:
+    _ = _summary
+    return True
+
+
+async def _run17_delivery_package(
+    session: AsyncSession,
+    llm: LLMClient,
+    memory: AgentMemory,
+    project_id: uuid.UUID,
+    master_doc: object,
+    tech_stack: TechStackDocument,
+    tm: TaskMemory,
+) -> None:
+    print("\n=== RUN 17: DEPLOYMENT PACKAGE ===")
+    from pathlib import Path
+
+    from forgeai.lifecycle.project_registry import ProjectRegistry
+
+    reg = ProjectRegistry(session)
+    await reg.ensure_active_project(
+        str(project_id),
+        getattr(master_doc, "project_name", "Task Manager"),
+        getattr(master_doc, "project_summary", BRIEF),
+    )
+    output_dir = Path("H:/forgeai-output") / str(project_id)
+    lead = LeadAgent(
+        "lead_agent_1",
+        session,
+        task_memory=tm,
+        llm_client=llm,
+        agent_memory=memory,
+    )
+    qa = QAAgent("qa_delivery", session, llm_client=llm)
+    await lead.deliver_project(
+        str(project_id),
+        str(output_dir),
+        auto_approve_delivery,
+        master_document=master_doc,
+        tech_stack_document=tech_stack,
+        qa_agent=qa,
+    )
+
+
 async def _run14_live_mode(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -1044,8 +1088,14 @@ async def _run14_live_mode(
 ) -> None:
     print("\n=== RUN 14: LIVE MODE ===")
     from forgeai.lifecycle.project_registry import ProjectRegistry
+    from forgeai.lifecycle.schemas import ProjectStatus
 
     reg = ProjectRegistry(session)
+    project = await reg.get_project(str(project_id))
+    if project is not None and project.status == ProjectStatus.LIVE:
+        print("[REGISTRY] Project already LIVE (Run 17) — skipping duplicate transition")
+        print(f"  Status: {project.status.value} | Release: {project.release_tag}")
+        return
     await reg.ensure_active_project(
         str(project_id),
         getattr(master_doc, "project_name", "Task Manager"),
@@ -1169,6 +1219,15 @@ async def async_main() -> None:
             await _run12_confidence_and_context(llm, tm)
             await _run13_final_review(
                 session, llm, memory, project_id, result.master_document
+            )
+            await _run17_delivery_package(
+                session,
+                llm,
+                memory,
+                project_id,
+                result.master_document,
+                result.tech_stack_document,
+                tm,
             )
             await _run14_live_mode(session, project_id, result.master_document)
             await _run15_patch_mode(session, llm, memory, project_id, result.master_document)

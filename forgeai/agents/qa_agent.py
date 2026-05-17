@@ -1,8 +1,11 @@
 """QA agent integrated with sandboxed test execution."""
 
+import asyncio
 import json
 import re
+import subprocess
 import uuid
+from pathlib import Path
 
 from forgeai.agents.base import BaseAgent
 from forgeai.contracts.schemas import NavigationContract, PageSpec
@@ -218,6 +221,27 @@ class QAAgent(BaseAgent):
             if route_hits == 0:
                 return False
         return True
+
+    async def validate_docker_build(self, output_dir: str) -> bool:
+        """Build the deployment Dockerfile in ``output_dir`` (Phase 10)."""
+        root = Path(output_dir)
+        if not (root / "Dockerfile").is_file():
+            return False
+
+        def _build() -> bool:
+            proc = subprocess.run(
+                ["docker", "build", "-t", "forgeai-delivery-verify", "."],
+                cwd=str(root),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            return proc.returncode == 0
+
+        try:
+            return await asyncio.to_thread(_build)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
 
     async def analyze_defects(self, task_specification: str, runner_output: RunnerOutput) -> str:
         """Optional LLM-assisted defect narrative from sandbox results."""
