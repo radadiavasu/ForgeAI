@@ -23,7 +23,7 @@ from forgeai.delivery.schemas import (
 from forgeai.llm.client import LLMClient
 from forgeai.llm.schemas import MasterDocument, TechStackDocument
 from forgeai.models.escalation import EscalationEventModel
-from forgeai.models.task import Task
+from forgeai.models.task import Task, TaskStateHistory
 from forgeai.state_machine.machine import TaskStateMachine
 from forgeai.state_machine.states import TaskState
 from forgeai.models.project_artefact import ProjectArtefactModel
@@ -138,13 +138,15 @@ class PackageAssembler:
         self.git.init_repo()
 
         pid = UUID(project_id)
-        done_tasks = await self._load_done_tasks(pid)
+        done_tasks, done_diag = await self._load_done_tasks(pid)
         logger.info(
-            "Package assembly: %d DONE task(s) for project %s",
+            "Package assembly: %d DONE task(s) for project %s (%s)",
             len(done_tasks),
             project_id,
+            done_diag,
         )
         print(f"[DELIVERY] Found {len(done_tasks)} DONE task(s) to write")
+        print(f"[DELIVERY] {done_diag}")
 
         files_written: list[str] = []
         total_bytes = 0
@@ -168,22 +170,23 @@ class PackageAssembler:
                 f"output={'set' if stored and stored.strip() else 'empty'}"
             )
 
-            domain = self._task_domain(task)
-            if domain.startswith("frontend"):
+            if self._is_frontend_task(task):
                 has_frontend = True
-            elif domain.startswith("backend"):
+            elif "backend" in (task.assigned_agent or "").lower():
                 has_backend = True
 
-            rel_path = self._derive_file_path(task.title, domain, tech_stack)
+            rel_path = self._derive_file_path(task, tech_stack)
             file_path = root / rel_path
             file_path.parent.mkdir(parents=True, exist_ok=True)
 
-            content = await self._resolve_write_content(task)
-            if not content.strip():
-                content = (
-                    f"# Task: {task.title}\n"
-                    "# Output not captured — task completed without code output\n"
-                )
+            content = task.output or ""
+            if self._needs_work_output_from_history(content):
+                review_out = await self._work_output_from_review_transition(task.id)
+                if review_out.strip():
+                    content = review_out
+
+            if not content.strip() or self._is_placeholder_output(content):
+                content = f"# Task: {task.title}\n# Output not captured\n"
 
             file_path.write_text(content, encoding="utf-8")
             nbytes = len(content.encode("utf-8"))
@@ -290,23 +293,30 @@ class PackageAssembler:
             total_size_bytes=total_bytes,
         )
 
-    def _derive_file_path(
-        self,
-        task_title: str,
-        task_domain: str,
-        tech_stack: TechStackDocument,
-    ) -> str:
+    def _derive_file_path(self, task: Task, tech_stack: TechStackDocument) -> str:
+        if self._is_frontend_task(task):
+            return self._derive_frontend_file_path(task.title)
+        title = task.title
+        domain = self._task_domain(task)
         _ = tech_stack
-        if task_domain == "test":
-            base = _name_from_title(task_title).lower()
+        if domain == "test":
+            base = _name_from_title(title).lower()
             return f"tests/test_{base}.py"
-        if task_domain == "frontend_page":
-            return f"src/pages/{_name_from_title(task_title)}.jsx"
-        if task_domain == "frontend_component":
-            return f"src/components/{_name_from_title(task_title)}.jsx"
-        if task_domain == "backend_model":
-            return f"src/models/{_api_module_filename(task_title)}.py"
-        return f"src/api/{_api_module_filename(task_title)}.py"
+        if domain == "backend_model":
+            return f"src/models/{_api_module_filename(title)}.py"
+        return f"src/api/{_api_module_filename(title)}.py"
+
+    def _derive_frontend_file_path(self, task_title: str) -> str:
+        lower = task_title.lower()
+        if "applayout" in lower.replace(" ", ""):
+            return "src/components/AppLayout.jsx"
+        if "dashboard" in lower and "page" in lower:
+            return "src/pages/Dashboard.jsx"
+        if "history" in lower and "page" in lower:
+            return "src/pages/History.jsx"
+        if "settings" in lower and "page" in lower:
+            return "src/pages/Settings.jsx"
+        return f"src/components/{_name_from_title(task_title)}.jsx"
 
     def _is_frontend_task(self, task: Task) -> bool:
         return "frontend" in (task.assigned_agent or "").lower()
@@ -418,16 +428,64 @@ class PackageAssembler:
             project_id=UUID(project_id),
         )
 
-    async def _load_done_tasks(self, project_id: UUID) -> list[Task]:
+    async def _work_output_from_review_transition(self, task_id: UUID) -> str:
         res = await self.db.execute(
-            select(Task)
+            select(TaskStateHistory)
             .where(
-                Task.project_id == project_id,
-                Task.current_state == TaskState.DONE,
+                TaskStateHistory.task_id == task_id,
+                TaskStateHistory.success.is_(True),
+                TaskStateHistory.from_state == TaskState.IN_PROGRESS,
+                TaskStateHistory.to_state == TaskState.IN_REVIEW,
             )
+            .order_by(TaskStateHistory.attempted_at.desc())
+        )
+        for row in res.scalars():
+            meta = row.metadata_ or {}
+            out = meta.get(KEY_WORK_OUTPUT)
+            if isinstance(out, str) and out.strip():
+                return out.strip()
+        return ""
+
+    def _needs_work_output_from_history(self, content: str) -> bool:
+        text = content.strip()
+        if not text:
+            return True
+        if self._is_placeholder_output(text):
+            return True
+        if len(text) < 50:
+            return True
+        if not any(kw in text for kw in ("def ", "export ", "import ", "class ", "function")):
+            return True
+        lower = text.lower()
+        if lower.endswith(" ok") and "export " not in text and "def " not in text:
+            return True
+        return False
+
+    async def _load_done_tasks(self, project_id: UUID) -> tuple[list[Task], str]:
+        """Load every DONE task for the project — no agent-type filter."""
+        all_res = await self.db.execute(
+            select(Task)
+            .where(Task.project_id == project_id)
             .order_by(Task.created_at)
         )
-        return list(res.scalars())
+        all_tasks = list(all_res.scalars())
+        done_tasks = [
+            t
+            for t in all_tasks
+            if (t.current_state.value if hasattr(t.current_state, "value") else t.current_state)
+            == TaskState.DONE.value
+        ]
+        fe_done = sum(1 for t in done_tasks if self._is_frontend_task(t))
+        be_done = sum(
+            1 for t in done_tasks if "backend" in (t.assigned_agent or "").lower()
+        )
+        other_done = len(done_tasks) - fe_done - be_done
+        diag = (
+            f"total tasks={len(all_tasks)}, DONE={len(done_tasks)} "
+            f"(frontend={fe_done}, backend={be_done}, other={other_done})"
+        )
+        logger.info("DONE task query for %s: %s", project_id, diag)
+        return done_tasks, diag
 
     async def _resolve_write_content(self, task: Task) -> str:
         """Content to write: ``task.output`` when usable, else history/artefact fallback."""
@@ -469,7 +527,10 @@ class PackageAssembler:
         return ""
 
     def _is_placeholder_output(self, text: str) -> bool:
-        return text.strip().lower() in _QA_PLACEHOLDER_OUTPUTS
+        lower = text.strip().lower()
+        if lower in _QA_PLACEHOLDER_OUTPUTS:
+            return True
+        return lower.endswith(" ok") and len(lower) < 80
 
     def _parse_work_output(self, raw: str, task: Task) -> str:
         """Normalize stored output (plain code or JSON bundle)."""

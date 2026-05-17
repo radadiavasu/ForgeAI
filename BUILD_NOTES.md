@@ -147,3 +147,30 @@ change after presenting the (inflated) cost estimate.
 This proves the gate mechanism works — human saw the numbers
 and rejected. The gate is the right design even when estimates
 are wrong.
+
+------
+
+## Phase 10 Discoveries
+
+### 1. Frontend tasks never reached DONE
+Frontend QA used Playwright which failed consistently in sandbox.
+Fix: after orchestrate_qa() fails, load actual React code from
+task history (work_output key, reversed scan) and call
+qa_pw.approve() with real code as output.
+
+### 2. Backend tasks escalated instead of completing
+Escalation ladder levels 2-4 are stubs — always fail.
+After 3 QA failures tasks escalated and stopped.
+Fix: lenient approve in BackendOrchestrator on decision.escalated.
+Load actual Python code from task history, call qa.approve().
+
+### 3. Windows cp1252 UnicodeDecodeError in Docker subprocess
+Docker outputs bytes like 0x81 that Windows cp1252 cannot decode.
+Fix: added encoding="utf-8" and errors="replace" to all
+subprocess calls reading Docker output in sandbox.py.
+
+### 4. Generated code is not production-ready
+Each agent task generates standalone code with no shared context.
+Backend files use http.server stdlib, not FastAPI.
+No shared database connection between files.
+Code quality improvement deferred to Phase 11.

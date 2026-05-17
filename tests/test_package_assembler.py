@@ -22,7 +22,7 @@ from forgeai.llm.schemas import (
     TechStack,
     TechStackDocument,
 )
-from forgeai.models.task import TaskComplexity
+from forgeai.models.task import Task, TaskComplexity
 from forgeai.state_machine.machine import TaskStateMachine
 from forgeai.state_machine.states import TaskState
 from forgeai.state_machine.transitions import KEY_OUTPUT, KEY_WORK_OUTPUT
@@ -179,21 +179,35 @@ async def test_assemble_writes_files_for_done_tasks(
     assert (tmp_path / "out" / "src" / "pages" / "Dashboard.jsx").is_file()
 
 
+def _mock_task(title: str, assigned_agent: str) -> Task:
+    task = MagicMock(spec=Task)
+    task.title = title
+    task.assigned_agent = assigned_agent
+    return task
+
+
 def test_derive_file_path_frontend_page() -> None:
     asm = PackageAssembler(MagicMock(), MagicMock(), MagicMock(), MagicMock())
     path = asm._derive_file_path(
-        "Build Dashboard page",
-        "frontend_page",
+        _mock_task("Build Dashboard page", "frontend_agent_1"),
         _tech_doc(),
     )
     assert path == "src/pages/Dashboard.jsx"
 
 
+def test_derive_file_path_applayout_component() -> None:
+    asm = PackageAssembler(MagicMock(), MagicMock(), MagicMock(), MagicMock())
+    path = asm._derive_file_path(
+        _mock_task("Build AppLayout — shared shell, NavBar, Footer", "frontend_agent_1"),
+        _tech_doc(),
+    )
+    assert path == "src/components/AppLayout.jsx"
+
+
 def test_derive_file_path_navbar_component() -> None:
     asm = PackageAssembler(MagicMock(), MagicMock(), MagicMock(), MagicMock())
     path = asm._derive_file_path(
-        "Build NavBar component",
-        "frontend_component",
+        _mock_task("Build NavBar component", "frontend_agent_2"),
         _tech_doc(),
     )
     assert path == "src/components/NavBar.jsx"
@@ -202,8 +216,7 @@ def test_derive_file_path_navbar_component() -> None:
 def test_derive_file_path_rest_api_for_tasks() -> None:
     asm = PackageAssembler(MagicMock(), MagicMock(), MagicMock(), MagicMock())
     path = asm._derive_file_path(
-        "REST API for tasks",
-        "backend_api",
+        _mock_task("REST API for tasks", "backend_agent_1"),
         _tech_doc(),
     )
     assert path == "src/api/tasks.py"
@@ -212,8 +225,7 @@ def test_derive_file_path_rest_api_for_tasks() -> None:
 def test_derive_file_path_backend_task_number_fallback() -> None:
     asm = PackageAssembler(MagicMock(), MagicMock(), MagicMock(), MagicMock())
     path = asm._derive_file_path(
-        "Backend task 3",
-        "backend_api",
+        _mock_task("Backend task 3", "backend_agent_1"),
         _tech_doc(),
     )
     assert path == "src/api/backend_module_3.py"
@@ -245,7 +257,7 @@ async def test_task_output_prefers_work_output_over_qa_placeholder(
     await sm.transition(task.id, TaskState.TESTING, "qa_1")
     await sm.transition(task.id, TaskState.DONE, "qa_1", **{KEY_OUTPUT: "QA approved"})
     asm = PackageAssembler(db_session, MagicMock(), MagicMock(), MagicMock())
-    out = await asm._resolve_write_content(task)
+    out = await asm._work_output_from_review_transition(task.id)
     assert "Settings" in out
 
 

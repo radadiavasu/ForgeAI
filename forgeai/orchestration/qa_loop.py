@@ -12,6 +12,7 @@ from typing import Any
 from pydantic import ValidationError
 from sqlalchemy import select
 
+from forgeai.exceptions import InvalidTransitionError
 from forgeai.escalation.ladder import EscalationLadder
 from forgeai.escalation.loop_counter import LoopCounter
 from forgeai.escalation.schemas import EscalationResult
@@ -160,6 +161,7 @@ class QAOrchestrator:
     ) -> QADecision:
         tid = uuid.UUID(task_id)
         if runner_output.success:
+            await self._ensure_testing_state(tid, qa_agent_id)
             await self._approve(tid, qa_agent_id)
             return QADecision(task_id=task_id, approved=True)
 
@@ -197,7 +199,25 @@ class QAOrchestrator:
             defect_report=defect_report,
         )
 
+    async def _ensure_testing_state(self, task_id: uuid.UUID, qa_agent_id: str) -> None:
+        """Require ``TESTING`` before ``TESTING`` → ``DONE`` (no IN_REVIEW shortcut)."""
+        task = await self._load_task(task_id)
+        if task.current_state == TaskState.TESTING:
+            return
+        if task.current_state == TaskState.IN_REVIEW:
+            await self.sm.transition(task_id, TaskState.TESTING, qa_agent_id)
+            return
+        raise InvalidTransitionError(
+            f"QA approval requires TESTING, got {task.current_state.value}"
+        )
+
     async def _approve(self, task_id: uuid.UUID, qa_agent_id: str) -> None:
+        """``TESTING`` → ``DONE`` via state machine (same path as ``QAAgent.approve``)."""
+        task = await self._load_task(task_id)
+        if task.current_state != TaskState.TESTING:
+            raise InvalidTransitionError(
+                f"_approve requires TESTING, got {task.current_state.value}"
+            )
         output = await self._resolve_output(task_id)
         await self.sm.transition(
             task_id,

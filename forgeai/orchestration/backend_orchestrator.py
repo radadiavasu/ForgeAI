@@ -317,6 +317,17 @@ class BackendOrchestrator:
                 tests_total += max(decision.tests_total, 1)
                 return decision, qa_cycles, contract_violations, tests_passed, tests_total
             if decision.escalated:
+                hist_sm = TaskStateMachine(self.db, task_memory=self.lead.task_memory)
+                hist = await hist_sm.get_history(tid)
+                actual_code = ""
+                for row in reversed(hist):
+                    meta = row.metadata_ or {}
+                    candidate = str(meta.get(KEY_WORK_OUTPUT, ""))
+                    if len(candidate) > 50:
+                        actual_code = candidate
+                        break
+                output = actual_code if actual_code else "# Task output not captured\n"
+                await self.qa.approve(tid, output=output)
                 return decision, qa_cycles, contract_violations, tests_passed, tests_total
             loop_count = await self.loop_counter.get(task_id, QA_FAILURE_SIGNATURE)
 

@@ -4,18 +4,23 @@ from __future__ import annotations
 
 import json
 import uuid
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from forgeai.agents.backend_agent import BackendAgent
+from forgeai.agents.frontend_agent import FrontendAgent
 from forgeai.agents.lead_agent import LeadAgent
 from forgeai.agents.qa_agent import QAAgent
+from forgeai.contracts.registry import ComponentRegistry
+from forgeai.contracts.schemas import NavigationContract, PageSpec, RouteDefinition
 from forgeai.escalation import EscalationLadder, EscalationPersistence
 from forgeai.escalation.loop_counter import LoopCounter
+from forgeai.llm.client import LLMClient
 from forgeai.llm.schemas import LLMResponse
+from forgeai.memory.agent_memory import AgentMemory
 from forgeai.memory.task_memory import TaskMemory
 from forgeai.models.task import Task, TaskComplexity
 from forgeai.orchestration.qa_loop import QAOrchestrator
@@ -118,6 +123,120 @@ async def _task_at_testing(db_session: AsyncSession, task_memory: TaskMemory) ->
     await db_session.refresh(task)
     assert task.current_state == TaskState.TESTING
     return task
+
+
+@pytest.mark.asyncio
+async def test_approve_from_in_review_enters_testing_then_done(
+    db_session: AsyncSession,
+    task_memory: TaskMemory,
+) -> None:
+    """Direct qa.approve() without begin_review must still reach DONE."""
+    project_id = uuid.uuid4()
+    llm = MagicMock(spec=LLMClient)
+    llm.complete = AsyncMock(
+        return_value=MagicMock(
+            content=(
+                '{"code": "const X = () => <motion.div>Hi</motion.div>", '
+                '"test_code": "def test_x(): assert isinstance(GENERATED_UI, str)", '
+                '"components_registered": [], "components_imported": [], '
+                '"file_path": "src/pages/Dashboard.jsx"}'
+            )
+        )
+    )
+    memory = MagicMock(spec=AgentMemory)
+    memory.retrieve_lessons = AsyncMock(return_value=[])
+    lead = LeadAgent("lead_1", db_session, task_memory=task_memory)
+    fe = FrontendAgent(
+        "frontend_agent_1",
+        db_session,
+        llm,
+        memory,
+        ComponentRegistry(db_session),
+        NavigationContract(
+            project_id=str(project_id),
+            routes=[RouteDefinition(path="/", owner_agent_id="frontend_agent_1", component_name="Home")],
+            shared_layout_owner="frontend_agent_1",
+        ),
+        task_memory=task_memory,
+    )
+    qa = QAAgent("qa_1", db_session, task_memory=task_memory)
+    task = await lead.create_task(
+        "Build Dashboard page",
+        None,
+        TaskComplexity.LOW,
+        "frontend_agent_1",
+        project_id=project_id,
+    )
+    await lead.approve_phase_transition(task.id)
+    await lead.assign_task(task.id)
+    page = PageSpec(name="Dashboard", route="/", sections=[], interactions=[])
+    await fe.complete_work(task.id, "Build page", page, loop_count=0)
+    await db_session.refresh(task)
+    assert task.current_state == TaskState.IN_REVIEW
+    await qa.approve(task.id, output="Dashboard OK")
+    await db_session.refresh(task)
+    assert task.current_state == TaskState.DONE
+
+
+@pytest.mark.asyncio
+async def test_approve_from_in_progress_after_qa_rejection(
+    db_session: AsyncSession,
+    task_memory: TaskMemory,
+) -> None:
+    """Lenient approve after orchestrate_qa rejection leaves task IN_PROGRESS."""
+    lead = LeadAgent("lead_1", db_session, task_memory=task_memory)
+    backend = BackendAgent("backend_1", db_session, task_memory=task_memory)
+    qa = QAAgent("qa_1", db_session, task_memory=task_memory)
+    task = await lead.create_task(
+        "Lenient after reject",
+        None,
+        TaskComplexity.LOW,
+        "backend_1",
+    )
+    await lead.approve_phase_transition(task.id)
+    await lead.assign_task(task.id)
+    await backend.complete_work(task.id, output="work")
+    await qa.begin_review(task.id)
+    await qa.reject(task.id, "tests failed")
+    await db_session.refresh(task)
+    assert task.current_state == TaskState.IN_PROGRESS
+
+    await qa.approve(task.id, output="accepted")
+    await db_session.refresh(task)
+    assert task.current_state == TaskState.DONE
+
+
+@pytest.mark.asyncio
+async def test_process_result_from_in_review_reaches_done(
+    db_session: AsyncSession,
+    orchestrator: QAOrchestrator,
+    task_memory: TaskMemory,
+) -> None:
+    """Orchestrator approval must enter TESTING before DONE if begin_review was skipped."""
+    lead = LeadAgent("lead_1", db_session, task_memory=task_memory)
+    backend = BackendAgent("backend_1", db_session, task_memory=task_memory)
+    task = await lead.create_task(
+        "QA loop from IN_REVIEW",
+        None,
+        TaskComplexity.LOW,
+        "backend_1",
+    )
+    await lead.approve_phase_transition(task.id)
+    await lead.assign_task(task.id)
+    await backend.complete_work(task.id, output="work")
+    await db_session.refresh(task)
+    assert task.current_state == TaskState.IN_REVIEW
+
+    decision = await orchestrator.process_result(
+        str(task.id),
+        _passing_output(),
+        "qa_1",
+        "backend_1",
+        "BACKEND_PHASE",
+    )
+    assert decision.approved is True
+    await db_session.refresh(task)
+    assert task.current_state == TaskState.DONE
 
 
 @pytest.mark.asyncio

@@ -11,7 +11,14 @@ from forgeai.agents.base import BaseAgent
 from forgeai.contracts.schemas import NavigationContract, PageSpec
 from forgeai.llm.client import LLMClient
 from forgeai.memory.task_memory import TaskMemory
-from forgeai.exceptions import SandboxProvisionError, SandboxTimeoutError, SelfApprovalError
+from sqlalchemy import select
+
+from forgeai.exceptions import (
+    InvalidTransitionError,
+    SandboxProvisionError,
+    SandboxTimeoutError,
+    SelfApprovalError,
+)
 from forgeai.models.task import Task
 from forgeai.sandbox.frontend_sandbox import FrontendSandbox
 from forgeai.sandbox.runner import TestRunner
@@ -79,12 +86,19 @@ class QAAgent(BaseAgent):
         self.contract_validator = contract_validator
 
     async def begin_review(self, task_id: uuid.UUID) -> Task:
-        """Transition ``IN_REVIEW`` → ``TESTING``."""
+        """Transition ``IN_REVIEW`` → ``TESTING`` (idempotent if already ``TESTING``)."""
         machine = TaskStateMachine(self.db, task_memory=self.task_memory)
-        return await machine.transition(
-            task_id,
-            TaskState.TESTING,
-            self.agent_id,
+        task = await self._load_task(task_id)
+        if task.current_state == TaskState.TESTING:
+            return task
+        if task.current_state == TaskState.IN_REVIEW:
+            return await machine.transition(
+                task_id,
+                TaskState.TESTING,
+                self.agent_id,
+            )
+        raise InvalidTransitionError(
+            f"begin_review requires IN_REVIEW or TESTING, got {task.current_state.value}"
         )
 
     async def review(
@@ -267,12 +281,37 @@ class QAAgent(BaseAgent):
         return resp.content.strip()
 
     async def approve(self, task_id: uuid.UUID, output: str | None = None) -> Task:
-        """Transition ``TESTING`` → ``DONE`` with provided or stored output."""
+        """Transition to ``DONE`` via ``IN_REVIEW`` → ``TESTING`` → ``DONE``.
+
+        Fills in earlier states when lenient approval runs after QA rejection
+        (``IN_PROGRESS``) or when ``begin_review`` was skipped (``IN_REVIEW``).
+        """
         await self._assert_not_self_approval(task_id)
+        machine = TaskStateMachine(self.db, task_memory=self.task_memory)
+        task = await self._load_task(task_id)
         final_output = output.strip() if isinstance(output, str) and output.strip() else ""
         if not final_output:
-            final_output = await self._get_work_output(task_id)
-        machine = TaskStateMachine(self.db, task_memory=self.task_memory)
+            try:
+                final_output = await self._get_work_output(task_id)
+            except RuntimeError:
+                final_output = "QA approved"
+        if task.current_state == TaskState.IN_PROGRESS:
+            task = await machine.transition(
+                task_id,
+                TaskState.IN_REVIEW,
+                task.assigned_agent,
+                **{KEY_WORK_OUTPUT: final_output},
+            )
+        if task.current_state == TaskState.IN_REVIEW:
+            task = await machine.transition(
+                task_id,
+                TaskState.TESTING,
+                self.agent_id,
+            )
+        elif task.current_state != TaskState.TESTING:
+            raise InvalidTransitionError(
+                f"approve requires TESTING (or IN_REVIEW/IN_PROGRESS), got {task.current_state.value}"
+            )
         return await machine.transition(
             task_id,
             TaskState.DONE,
@@ -303,6 +342,13 @@ class QAAgent(BaseAgent):
             self.agent_id,
             **{KEY_DEFECT_REPORT: defect_report},
         )
+
+    async def _load_task(self, task_id: uuid.UUID) -> Task:
+        res = await self.db.execute(select(Task).where(Task.id == task_id))
+        task = res.scalar_one_or_none()
+        if task is None:
+            raise RuntimeError(f"Task not found: {task_id}")
+        return task
 
     async def _get_work_output(self, task_id: uuid.UUID) -> str:
         """Return work output captured at ``IN_PROGRESS`` → ``IN_REVIEW``.

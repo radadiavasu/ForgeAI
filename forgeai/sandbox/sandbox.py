@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import subprocess
 import tarfile
 import time
 from dataclasses import dataclass
@@ -89,7 +90,7 @@ class Sandbox:
         timeout = self._timeout_for_complexity()
 
         try:
-            await asyncio.to_thread(self._client.images.pull, self.config.image)
+            await asyncio.to_thread(self._docker_pull, self.config.image)
             name = f"forgeai-sandbox-{uuid4()}"
             nano_cpus = int(self.config.cpu_limit * 1_000_000_000)
             logger.info("Provisioning sandbox container %s", name)
@@ -195,3 +196,14 @@ class Sandbox:
             "HIGH": self.config.timeout_high,
         }
         return mapping.get(self.complexity, self.config.timeout_medium)
+
+    def _docker_pull(self, image: str) -> None:
+        """Pull image via Docker CLI with UTF-8-safe stdout/stderr (Windows cp1252)."""
+        subprocess.run(
+            ["docker", "pull", image],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
