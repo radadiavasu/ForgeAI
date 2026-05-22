@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     max_self_retries: int = 2
     redis_url: str = "redis://localhost:6379"
     chroma_host: str = "localhost"
-    chroma_port: int = 8000
+    chroma_port: int = 8001
     minio_endpoint: str = "localhost:9000"
     minio_access_key: str = "forgeai"
     minio_secret_key: str = "forgeai_dev"
