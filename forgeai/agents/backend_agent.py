@@ -56,6 +56,21 @@ async def load_tech_stack_document(db_session, project_id: uuid.UUID) -> TechSta
     return TechStackDocument.model_validate(row.content)
 
 
+def format_critical_language_block(tech_stack: TechStackDocument) -> str:
+    """Explicit language/framework guard placed immediately before the task description."""
+    lang = tech_stack.language.lower()
+    if "javascript" not in lang and "typescript" not in lang:
+        return ""
+    framework = tech_stack.framework
+    return (
+        f"CRITICAL: You are generating {tech_stack.language} code.\n"
+        f"Framework: {framework}\n"
+        f"You MUST write JavaScript/TypeScript using {framework}.\n"
+        "DO NOT write Python. DO NOT use http.server, Flask, or FastAPI.\n"
+        "File extension must be .js or .ts, NOT .py"
+    )
+
+
 def format_mandatory_tech_stack_block(tech_stack: TechStackDocument) -> str:
     """Mandatory constraint block injected at the top of code-generation prompts."""
     libs = ", ".join(tech_stack.libraries) if tech_stack.libraries else "(none listed)"
@@ -197,10 +212,13 @@ class BackendAgent(BaseAgent):
                 "request schema, and response schema. Any deviation is a defect."
             )
         tech_block = ""
+        critical_block = ""
         if tech_stack:
             tech_block = format_mandatory_tech_stack_block(tech_stack) + "\n\n"
+            critical_block = format_critical_language_block(tech_stack) + "\n\n"
         user_message = (
             f"{tech_block}"
+            f"{critical_block}"
             f"Task:\n{task_description}\n\n"
             f"Master document context:\n{master_document_section}\n"
             f"{contract_block}"

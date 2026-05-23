@@ -705,37 +705,42 @@ async def _run8_human_gate(
     print("\n=== RUN 8: HUMAN GATE ===")
     lead = LeadAgent("lead_agent_1", session, task_memory=tm, llm_client=llm, agent_memory=memory)
     reg = ComponentRegistry(session)
-    plan = AgentBootstrapProtocol.default_task_plan()
-    for spec in plan.backend_tasks:
-        exists = (
-            await session.execute(
-                select(Task).where(Task.project_id == project_id, Task.title == spec.title)
-            )
-        ).scalar_one_or_none()
-        if exists is None:
-            await lead.create_task(
-                title=spec.title,
-                description=spec.description,
-                complexity=TaskComplexity[spec.complexity],
-                assigned_agent="backend_agent_1",
-                project_id=project_id,
-            )
-    extra_backend = 14
-    for i in range(extra_backend):
-        title = f"Backend task {i + 2}"
-        exists = (
-            await session.execute(
-                select(Task).where(Task.project_id == project_id, Task.title == title)
-            )
-        ).scalar_one_or_none()
-        if exists is None:
-            await lead.create_task(
-                title=title,
-                description="Phase-locked backend work",
-                complexity=TaskComplexity.LOW,
-                assigned_agent="backend_agent_1",
-                project_id=project_id,
-            )
+    master = await lead._load_master_document_for_project(project_id)
+    if master is not None and master.api_surfaces:
+        await lead.create_backend_tasks_from_master_document(
+            project_id, master, assigned_agent="backend_agent_1"
+        )
+    else:
+        plan = AgentBootstrapProtocol.default_task_plan()
+        for spec in plan.backend_tasks:
+            exists = (
+                await session.execute(
+                    select(Task).where(Task.project_id == project_id, Task.title == spec.title)
+                )
+            ).scalar_one_or_none()
+            if exists is None:
+                await lead.create_task(
+                    title=spec.title,
+                    description=spec.description,
+                    complexity=TaskComplexity[spec.complexity],
+                    assigned_agent="backend_agent_1",
+                    project_id=project_id,
+                )
+        for i in range(1, 16):
+            title = f"Backend task {i}"
+            exists = (
+                await session.execute(
+                    select(Task).where(Task.project_id == project_id, Task.title == title)
+                )
+            ).scalar_one_or_none()
+            if exists is None:
+                await lead.create_task(
+                    title=title,
+                    description="Phase-locked backend work",
+                    complexity=TaskComplexity.LOW,
+                    assigned_agent="backend_agent_1",
+                    project_id=project_id,
+                )
 
     res = await session.execute(
         select(Task).where(
@@ -886,7 +891,10 @@ async def _run10_backend_phase_gate(
     print("[LEAD] Phase: BACKEND_PHASE → FINAL_REVIEW")
 
 
-async def _run11_agent_memory_upgrades(memory: AgentMemory) -> None:
+async def _run11_agent_memory_upgrades(
+    memory: AgentMemory,
+    tech_stack: TechStackDocument | None = None,
+) -> None:
     print("\n=== RUN 11: AGENT MEMORY UPGRADES ===")
     pid = "00000000-0000-0000-0000-000000000099"
     tid = "00000000-0000-0000-0000-000000000098"
@@ -916,7 +924,19 @@ async def _run11_agent_memory_upgrades(memory: AgentMemory) -> None:
         await memory.write_lesson(les)
         print(f"[MEMORY] Lesson {label} written — confidence: {conf} (resolved at Level {level})")
 
-    ctx = {"language": "Python", "framework": "React", "database": "PostgreSQL"}
+    ts = tech_stack or TechStackDocument(
+        language="Python",
+        framework="React",
+        database="PostgreSQL",
+        testing_framework="pytest",
+        rationale="demo",
+    )
+    ctx = {
+        "language": ts.language,
+        "framework": ts.framework,
+        "database": ts.database,
+    }
+    tech_stack_summary = f"{ts.language}, {ts.framework}, {ts.database}"
     ranked = await memory.retrieve_lessons(
         "backend_agent",
         "Build a task creation API endpoint",
@@ -955,13 +975,6 @@ async def _run11_agent_memory_upgrades(memory: AgentMemory) -> None:
     if flagged and flagged.flagged:
         print("[MEMORY] Lesson A flagged — excluded from future results")
 
-    ts = TechStackDocument(
-        language="Python",
-        framework="React",
-        database="PostgreSQL",
-        testing_framework="pytest",
-        rationale="demo",
-    )
     django_guards = build_context_guards(
         TechStackDocument(
             language="Python",
@@ -998,7 +1011,7 @@ async def _run11_agent_memory_upgrades(memory: AgentMemory) -> None:
         ranked[:3],
         "Build a task creation API endpoint",
         "Personal task manager with CRUD",
-        "Python, React, PostgreSQL",
+        tech_stack_summary,
     )
     print("\n[MEMORY] APPLY/ADAPT/IGNORE prompt section:")
     print(prompt_block[:600] + ("…" if len(prompt_block) > 600 else ""))
@@ -1288,7 +1301,7 @@ async def async_main() -> None:
             await _run10_backend_phase_gate(
                 session, llm, memory, project_id, tm, backend_result
             )
-            await _run11_agent_memory_upgrades(memory)
+            await _run11_agent_memory_upgrades(memory, result.tech_stack_document)
             await _run12_confidence_and_context(llm, tm)
             await _run13_final_review(
                 session, llm, memory, project_id, result.master_document

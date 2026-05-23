@@ -293,18 +293,26 @@ class PackageAssembler:
             total_size_bytes=total_bytes,
         )
 
+    def _backend_source_extension(self, task: Task, tech_stack: TechStackDocument) -> str:
+        if "backend" not in (task.assigned_agent or "").lower():
+            return ".py"
+        lang = tech_stack.language.lower()
+        if "javascript" in lang or "typescript" in lang:
+            return ".js"
+        return ".py"
+
     def _derive_file_path(self, task: Task, tech_stack: TechStackDocument) -> str:
         if self._is_frontend_task(task):
             return self._derive_frontend_file_path(task.title)
         title = task.title
         domain = self._task_domain(task)
-        _ = tech_stack
+        ext = self._backend_source_extension(task, tech_stack)
         if domain == "test":
             base = _name_from_title(title).lower()
-            return f"tests/test_{base}.py"
+            return f"tests/test_{base}{ext if ext == '.js' else '.py'}"
         if domain == "backend_model":
-            return f"src/models/{_api_module_filename(title)}.py"
-        return f"src/api/{_api_module_filename(title)}.py"
+            return f"src/models/{_api_module_filename(title)}{ext}"
+        return f"src/api/{_api_module_filename(title)}{ext}"
 
     def _derive_frontend_file_path(self, task_title: str) -> str:
         lower = task_title.lower()

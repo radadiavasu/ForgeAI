@@ -67,14 +67,14 @@ def _backend_endpoint_task_title(method: str, path: str) -> str:
     route = (path or "/").strip()
     if route and not route.startswith("/"):
         route = f"/{route}"
-    return f"Implement {verb} {route} endpoint"
+    return f"Implement {verb} {route}"
 
 
 def _backend_tasks_from_master_doc(master_doc: MasterDocument) -> list[TaskSpec]:
     """One backend task per API surface in the Master_Document."""
     tasks: list[TaskSpec] = []
     for surface in master_doc.api_surfaces:
-        title = _backend_endpoint_task_title(surface.method, surface.endpoint)
+        title = f"Implement {surface.method} {surface.endpoint}"
         desc = (surface.description or "").strip() or title
         tasks.append(
             TaskSpec(
@@ -497,6 +497,55 @@ class LeadAgent(BaseAgent):
             ),
         )
 
+    async def _load_master_document_for_project(
+        self, project_id: uuid.UUID
+    ) -> MasterDocument | None:
+        row = (
+            await self.db.execute(
+                select(ProjectArtefactModel).where(
+                    ProjectArtefactModel.project_id == project_id,
+                    ProjectArtefactModel.artefact_type == "master_document",
+                    ProjectArtefactModel.is_current.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        return MasterDocument.model_validate(row.content)
+
+    async def create_backend_tasks_from_master_document(
+        self,
+        project_id: uuid.UUID,
+        master_document: MasterDocument,
+        *,
+        assigned_agent: str = "backend_agent_1",
+    ) -> list[Task]:
+        """Create one PHASE_LOCKED backend task per Master_Document API surface."""
+        if not master_document.api_surfaces:
+            return []
+
+        created: list[Task] = []
+        for spec in _backend_tasks_from_master_doc(master_document):
+            exists = (
+                await self.db.execute(
+                    select(Task).where(
+                        Task.project_id == project_id,
+                        Task.title == spec.title,
+                    )
+                )
+            ).scalar_one_or_none()
+            if exists is not None:
+                continue
+            task = await self.create_task(
+                title=spec.title,
+                description=spec.description,
+                complexity=TaskComplexity[spec.complexity],
+                assigned_agent=assigned_agent,
+                project_id=project_id,
+            )
+            created.append(task)
+        return created
+
     async def initiate_navigation_contract(
         self,
         frontend_agents: list[FrontendAgent],
@@ -857,6 +906,18 @@ class LeadAgent(BaseAgent):
         """Compile report, review API contract, present human gate, unlock backend."""
         if self._llm_client is None:
             raise RuntimeError("LeadAgent needs llm_client for human gate")
+        master = await self._load_master_document_for_project(project_id)
+        if master is not None:
+            n = len(
+                await self.create_backend_tasks_from_master_document(
+                    project_id, master
+                )
+            )
+            if n:
+                logger.info(
+                    "[LEAD] Created %d backend task(s) from Master_Document API surfaces",
+                    n,
+                )
         phase_gate = PhaseGate(self, self._llm_client, self.db)
         report = await phase_gate.compile_report(
             frontend_phase_result,
