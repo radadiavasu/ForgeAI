@@ -21,7 +21,13 @@ from forgeai.agents.frontend_agent import FrontendAgent
 from forgeai.agents.qa_agent import QAAgent
 from forgeai.agents.research_agent import ResearchAgent
 from forgeai.bootstrap.protocol import AgentBootstrapProtocol
-from forgeai.bootstrap.schemas import AgentRecommendation, ApprovedConfig, BootstrapResult, TaskPlan
+from forgeai.bootstrap.schemas import (
+    AgentRecommendation,
+    ApprovedConfig,
+    BootstrapResult,
+    TaskPlan,
+    TaskSpec,
+)
 from forgeai.contracts.navigation import NavigationNegotiator
 from forgeai.contracts.registry import ComponentRegistry
 from forgeai.contracts.schemas import LayoutSpecification, NavigationContract, PageSpec
@@ -51,6 +57,94 @@ from forgeai.state_machine.states import TaskState
 from forgeai.state_machine.transitions import KEY_METADATA, KEY_PHASE_APPROVAL, KEY_WORK_OUTPUT
 
 logger = logging.getLogger(__name__)
+
+ROOT_LAYOUT_TASK_TITLE = "Build AppLayout — shared shell, NavBar, Footer"
+
+
+def _backend_endpoint_task_title(method: str, path: str) -> str:
+    """Title for a backend task tied to one API surface."""
+    verb = (method or "GET").strip().upper()
+    route = (path or "/").strip()
+    if route and not route.startswith("/"):
+        route = f"/{route}"
+    return f"Implement {verb} {route} endpoint"
+
+
+def _backend_tasks_from_master_doc(master_doc: MasterDocument) -> list[TaskSpec]:
+    """One backend task per API surface in the Master_Document."""
+    tasks: list[TaskSpec] = []
+    for surface in master_doc.api_surfaces:
+        title = _backend_endpoint_task_title(surface.method, surface.endpoint)
+        desc = (surface.description or "").strip() or title
+        tasks.append(
+            TaskSpec(
+                title=title,
+                description=desc,
+                complexity="MEDIUM",
+                phase="BACKEND_PHASE",
+                dependencies=[],
+            )
+        )
+    return tasks
+
+
+def _numbered_backend_tasks(count: int) -> list[TaskSpec]:
+    """Fallback when Master_Document defines no API surfaces."""
+    return [
+        TaskSpec(
+            title=f"Backend task {i}",
+            description="Phase-locked backend work",
+            complexity="LOW",
+            phase="BACKEND_PHASE",
+            dependencies=[],
+        )
+        for i in range(1, max(count, 1) + 1)
+    ]
+
+
+def _frontend_tasks_from_navigation(nav: NavigationContract) -> list[TaskSpec]:
+    """Frontend tasks from Navigation_Contract component names."""
+    tasks: list[TaskSpec] = [
+        TaskSpec(
+            title=ROOT_LAYOUT_TASK_TITLE,
+            description="Root layout and shared navigation shell.",
+            complexity="MEDIUM",
+            phase="FRONTEND_PHASE",
+            dependencies=[],
+        )
+    ]
+    seen: set[str] = set()
+    layout_key = (nav.shared_layout_component or "AppLayout").strip().lower()
+    for route in nav.routes:
+        comp = (route.component_name or "").strip()
+        if not comp:
+            continue
+        key = comp.lower()
+        if route.is_root_layout or key == layout_key:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        tasks.append(
+            TaskSpec(
+                title=f"Build {comp} component",
+                description=f"Implement {comp} for route {route.path}.",
+                complexity="LOW",
+                phase="FRONTEND_PHASE",
+                dependencies=[ROOT_LAYOUT_TASK_TITLE],
+            )
+        )
+    return tasks
+
+
+def _complexity_distribution(*task_groups: list[TaskSpec]) -> dict[str, int]:
+    dist = {"LOW": 0, "MEDIUM": 0, "HIGH": 0}
+    for group in task_groups:
+        for spec in group:
+            level = (spec.complexity or "LOW").upper()
+            if level in dist:
+                dist[level] += 1
+    return dist
 
 
 def _strip_json_fence(raw: str) -> str:
@@ -305,19 +399,38 @@ class LeadAgent(BaseAgent):
             project_id=project_id,
         )
 
-    async def decompose_tasks(self, master_doc: MasterDocument) -> TaskPlan:
+    async def _llm_decompose_task_plan(
+        self,
+        master_doc: MasterDocument,
+        *,
+        frontend_only: bool = False,
+    ) -> TaskPlan | None:
+        """LLM task decomposition; returns None on parse failure."""
         if self._llm_client is None:
-            return AgentBootstrapProtocol.default_task_plan()
-        user_message = (
-            "Decompose the following Master_Document into a JSON object with keys: "
-            "frontend_tasks, backend_tasks, total_tasks, estimated_complexity_distribution.\n"
-            "Each task must have: title, description, complexity (LOW|MEDIUM|HIGH), "
-            "phase (FRONTEND_PHASE|BACKEND_PHASE), dependencies (array of task titles).\n"
-            "Include a root frontend task titled exactly "
-            "'Build AppLayout — shared shell, NavBar, Footer' with no dependencies. "
-            "All other FRONTEND_PHASE tasks must list that title in dependencies.\n\n"
-            f"{master_doc.model_dump_json()}"
-        )
+            return None
+        if frontend_only:
+            user_message = (
+                "Decompose frontend work from this Master_Document into JSON with key "
+                "frontend_tasks (array). Each task: title, description, complexity "
+                "(LOW|MEDIUM|HIGH), phase (FRONTEND_PHASE), dependencies (task titles). "
+                "Include a root task titled exactly "
+                f"'{ROOT_LAYOUT_TASK_TITLE}' with no dependencies. "
+                "Page tasks should be titled 'Build {ComponentName} component'.\n\n"
+                f"{master_doc.model_dump_json()}"
+            )
+        else:
+            user_message = (
+                "Decompose the following Master_Document into a JSON object with keys: "
+                "frontend_tasks, backend_tasks, total_tasks, estimated_complexity_distribution.\n"
+                "Each task must have: title, description, complexity (LOW|MEDIUM|HIGH), "
+                "phase (FRONTEND_PHASE|BACKEND_PHASE), dependencies (array of task titles).\n"
+                "Include a root frontend task titled exactly "
+                f"'{ROOT_LAYOUT_TASK_TITLE}' with no dependencies. "
+                "All other FRONTEND_PHASE tasks must list that title in dependencies.\n"
+                "Backend task titles must name the HTTP method and path "
+                '(e.g. "Implement GET /tasks endpoint").\n\n'
+                f"{master_doc.model_dump_json()}"
+            )
         resp = await self._llm_client.complete(
             system_prompt="You are Lead_Agent. Output JSON only.",
             user_message=user_message,
@@ -327,10 +440,62 @@ class LeadAgent(BaseAgent):
         )
         try:
             raw = _extract_json_object(resp.content)
+            if frontend_only:
+                items = raw.get("frontend_tasks", [])
+                frontend_tasks = [
+                    TaskSpec.model_validate(item)
+                    for item in items
+                    if isinstance(item, dict)
+                ]
+                return TaskPlan(frontend_tasks=frontend_tasks)
             return TaskPlan.model_validate(raw)
         except Exception:
-            logger.warning("[LEAD] TaskPlan parse failed; using default task plan")
-            return AgentBootstrapProtocol.default_task_plan()
+            logger.warning("[LEAD] TaskPlan parse failed")
+            return None
+
+    async def decompose_tasks(
+        self,
+        master_doc: MasterDocument,
+        *,
+        navigation_contract: NavigationContract | None = None,
+    ) -> TaskPlan:
+        """Decompose work into a task plan with specific titles from project artefacts."""
+        default_plan = AgentBootstrapProtocol.default_task_plan()
+        use_api_backend = bool(master_doc.api_surfaces)
+        use_nav_frontend = navigation_contract is not None
+
+        llm_plan: TaskPlan | None = None
+        if self._llm_client is not None and (not use_api_backend or not use_nav_frontend):
+            llm_plan = await self._llm_decompose_task_plan(
+                master_doc,
+                frontend_only=use_api_backend and not use_nav_frontend,
+            )
+
+        if use_api_backend:
+            backend_tasks = _backend_tasks_from_master_doc(master_doc)
+        elif llm_plan is not None and llm_plan.backend_tasks:
+            backend_tasks = llm_plan.backend_tasks
+        elif default_plan.backend_tasks:
+            backend_tasks = list(default_plan.backend_tasks)
+        else:
+            backend_tasks = _numbered_backend_tasks(1)
+
+        if use_nav_frontend:
+            frontend_tasks = _frontend_tasks_from_navigation(navigation_contract)
+        elif llm_plan is not None and llm_plan.frontend_tasks:
+            frontend_tasks = llm_plan.frontend_tasks
+        else:
+            frontend_tasks = list(default_plan.frontend_tasks)
+
+        total = len(frontend_tasks) + len(backend_tasks)
+        return TaskPlan(
+            frontend_tasks=frontend_tasks,
+            backend_tasks=backend_tasks,
+            total_tasks=total,
+            estimated_complexity_distribution=_complexity_distribution(
+                frontend_tasks, backend_tasks
+            ),
+        )
 
     async def initiate_navigation_contract(
         self,

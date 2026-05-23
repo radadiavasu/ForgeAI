@@ -7,9 +7,11 @@ import subprocess
 import uuid
 from pathlib import Path
 
+from forgeai.agents.backend_agent import format_mandatory_tech_stack_block, load_tech_stack_document
 from forgeai.agents.base import BaseAgent
 from forgeai.contracts.schemas import NavigationContract, PageSpec
 from forgeai.llm.client import LLMClient
+from forgeai.llm.schemas import TechStackDocument
 from forgeai.memory.task_memory import TaskMemory
 from sqlalchemy import select
 
@@ -29,7 +31,7 @@ from forgeai.state_machine.states import TaskState
 from forgeai.state_machine.transitions import KEY_DEFECT_REPORT, KEY_OUTPUT, KEY_WORK_OUTPUT
 
 QA_DEFECT_ANALYSIS_PROMPT = """
-You are QA_Agent. Given a task description and pytest/sandbox output, write a concise
+You are QA_Agent. Given a task description and test/sandbox output, write a concise
 defect report for the developer: bullet points for each failure, likely root cause,
 and concrete fix hints. Output plain text only.
 """.strip()
@@ -52,6 +54,29 @@ Requirements:
 - Output ONLY the JavaScript source code. No markdown fences, no commentary outside the file.
 """.strip()
 
+QA_VITEST_GENERATION_PROMPT = """
+You are QA_Agent. Generate a single Vitest test file (JavaScript) for the page described
+in the PageSpec. Use import { describe, it, expect } from 'vitest'.
+
+Requirements:
+- Use describe with the page name.
+- Assert route paths and section content using DOM-like expectations where applicable.
+- Match NavigationContract routes when verifying navigation.
+- Output ONLY the JavaScript source code. No markdown fences, no commentary outside the file.
+""".strip()
+
+QA_BACKEND_PYTEST_PROMPT = """
+You are QA_Agent. Generate Python pytest tests for the provided implementation code.
+Import from main (or the module under test) and assert behaviour described in the task.
+Output ONLY the pytest source. No markdown fences, no commentary outside the file.
+""".strip()
+
+QA_BACKEND_VITEST_PROMPT = """
+You are QA_Agent. Generate JavaScript Vitest tests for the provided implementation code.
+Use import { describe, it, expect } from 'vitest'.
+Output ONLY the Vitest test source. No markdown fences, no commentary outside the file.
+""".strip()
+
 
 def _strip_js_fence(raw: str) -> str:
     s = raw.strip()
@@ -63,6 +88,28 @@ def _strip_js_fence(raw: str) -> str:
             lines = lines[:-1]
         s = "\n".join(lines)
     return s.strip()
+
+
+def _strip_code_fence(raw: str) -> str:
+    """Strip markdown fences from LLM output (JavaScript or Python)."""
+    return _strip_js_fence(raw)
+
+
+def _backend_test_system_prompt(tech_stack: TechStackDocument) -> str:
+    tf = tech_stack.testing_framework.lower()
+    if "vitest" in tf:
+        return QA_BACKEND_VITEST_PROMPT
+    if "pytest" in tf:
+        return QA_BACKEND_PYTEST_PROMPT
+    if "jest" in tf:
+        return (
+            "You are QA_Agent. Generate JavaScript Jest tests for the implementation. "
+            "Output ONLY Jest source. No markdown fences."
+        )
+    return (
+        f"You are QA_Agent. Generate tests using {tech_stack.testing_framework}. "
+        "Output ONLY test source. No markdown fences."
+    )
 
 
 class QAAgent(BaseAgent):
@@ -140,6 +187,21 @@ class QAAgent(BaseAgent):
                 )
         if self.test_runner is None:
             raise RuntimeError("QAAgent requires a TestRunner for review()")
+        if (
+            development_phase == "BACKEND_PHASE"
+            and not test_code.strip()
+            and self.llm is not None
+        ):
+            res = await self.db.execute(select(Task).where(Task.id == task_id))
+            task = res.scalar_one_or_none()
+            if task is not None:
+                tech_stack = await load_tech_stack_document(self.db, task.project_id)
+                if tech_stack:
+                    test_code = await self.generate_backend_tests(
+                        code,
+                        task_description or "",
+                        tech_stack,
+                    )
         return await self.test_runner.run(code=code, test_code=test_code)
 
     async def _run_playwright(self, code: str, test_code: str) -> RunnerOutput:
@@ -174,24 +236,62 @@ class QAAgent(BaseAgent):
                 sandbox_error=str(exc),
             )
 
+    async def generate_backend_tests(
+        self,
+        code: str,
+        task_description: str,
+        tech_stack: TechStackDocument,
+    ) -> str:
+        """Generate backend tests using the project's testing framework from Tech_Stack_Document."""
+        if self.llm is None:
+            raise RuntimeError("QAAgent requires llm_client for generate_backend_tests()")
+
+        tech_block = format_mandatory_tech_stack_block(tech_stack)
+        user_message = (
+            f"{tech_block}\n\n"
+            f"Task:\n{task_description}\n\n"
+            f"Implementation:\n{code}"
+        )
+        resp = await self.llm.complete(
+            system_prompt=_backend_test_system_prompt(tech_stack),
+            user_message=user_message,
+            complexity="LOW",
+            loop_count=0,
+            max_tokens=8192,
+        )
+        return _strip_code_fence(resp.content)
+
     async def generate_playwright_tests(
         self,
         page_spec: PageSpec,
         navigation_contract: NavigationContract,
     ) -> str:
-        """Generate a Playwright test module from layout and navigation context."""
+        """Generate frontend tests from layout context (Playwright or Vitest per tech stack)."""
         if self.llm is None:
             raise RuntimeError("QAAgent requires llm_client for generate_playwright_tests()")
+
+        tech_stack: TechStackDocument | None = None
+        try:
+            project_uuid = uuid.UUID(navigation_contract.project_id)
+        except ValueError:
+            project_uuid = None
+        if project_uuid is not None:
+            tech_stack = await load_tech_stack_document(self.db, project_uuid)
+        use_vitest = tech_stack is not None and "vitest" in tech_stack.testing_framework.lower()
+        system_prompt = QA_VITEST_GENERATION_PROMPT if use_vitest else QA_PLAYWRIGHT_GENERATION_PROMPT
 
         user_payload = {
             "page_spec": page_spec.model_dump(mode="json"),
             "navigation_contract": navigation_contract.model_dump(mode="json"),
         }
-        user_message = json.dumps(user_payload, indent=2)
+        prefix = ""
+        if tech_stack:
+            prefix = format_mandatory_tech_stack_block(tech_stack) + "\n\n"
+        user_message = prefix + json.dumps(user_payload, indent=2)
 
         async def _call(complexity: str) -> str:
             resp = await self.llm.complete(
-                system_prompt=QA_PLAYWRIGHT_GENERATION_PROMPT,
+                system_prompt=system_prompt,
                 user_message=user_message,
                 complexity=complexity,
                 loop_count=0,
@@ -200,10 +300,16 @@ class QAAgent(BaseAgent):
             return _strip_js_fence(resp.content)
 
         text = await _call("LOW")
-        if self._validate_generated_playwright(page_spec, navigation_contract, text):
+        if use_vitest:
+            if "vitest" in text and "describe(" in text:
+                return text
+        elif self._validate_generated_playwright(page_spec, navigation_contract, text):
             return text
         text = await _call("MEDIUM")
-        if self._validate_generated_playwright(page_spec, navigation_contract, text):
+        if use_vitest:
+            if "vitest" in text and "describe(" in text:
+                return text
+        elif self._validate_generated_playwright(page_spec, navigation_contract, text):
             return text
         return text
 

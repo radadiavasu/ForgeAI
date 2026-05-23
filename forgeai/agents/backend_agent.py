@@ -12,6 +12,8 @@ from sqlalchemy import select
 
 from forgeai.agents.base import BaseAgent
 from forgeai.llm.client import LLMClient
+from forgeai.llm.schemas import TechStackDocument
+from forgeai.models.project_artefact import ProjectArtefactModel
 from forgeai.models.task import Task
 from forgeai.memory.agent_memory import AgentMemory
 from forgeai.state_machine.machine import TaskStateMachine
@@ -21,8 +23,9 @@ from forgeai.state_machine.transitions import KEY_METADATA, KEY_WORK_OUTPUT
 logger = logging.getLogger(__name__)
 
 BACKEND_ROLE_PROMPT = """
-You are Backend_Agent. Implement the assigned task as Python application code suitable
-for a module named main.py in a sandbox. Prefer clear functions and minimal dependencies.
+You are Backend_Agent. Implement the assigned task as application code suitable for
+sandbox execution. Use only the language, framework, and libraries from the mandatory
+tech stack when it is provided.
 
 When an API_Contract is provided, your implementation is bound by it. The endpoint path,
 HTTP method, request schema, and response schema are not suggestions — they are the
@@ -30,11 +33,55 @@ contract. QA_Agent will validate your output against the contract. Any deviation
 rejected as a defect.
 
 Output JSON with fields:
-- "code": complete Python source for main.py
-- "test_code": pytest module that imports from main and validates behaviour
+- "code": complete implementation source for the primary module (e.g. main.py or index.js)
+- "test_code": tests using the project's testing framework
 
-If you cannot emit JSON, output only the Python source for main.py.
+If you cannot emit JSON, output only the implementation source.
 """.strip()
+
+
+async def load_tech_stack_document(db_session, project_id: uuid.UUID) -> TechStackDocument | None:
+    """Load current Tech_Stack_Document from project artefacts (same pattern as delivery)."""
+    row = (
+        await db_session.execute(
+            select(ProjectArtefactModel).where(
+                ProjectArtefactModel.project_id == project_id,
+                ProjectArtefactModel.artefact_type == "tech_stack_document",
+                ProjectArtefactModel.is_current.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+    return TechStackDocument.model_validate(row.content)
+
+
+def format_mandatory_tech_stack_block(tech_stack: TechStackDocument) -> str:
+    """Mandatory constraint block injected at the top of code-generation prompts."""
+    libs = ", ".join(tech_stack.libraries) if tech_stack.libraries else "(none listed)"
+    return (
+        "MANDATORY TECH STACK — you must use these exact technologies:\n"
+        f"  Language: {tech_stack.language}\n"
+        f"  Framework: {tech_stack.framework}\n"
+        f"  Database: {tech_stack.database}\n"
+        f"  Testing: {tech_stack.testing_framework}\n"
+        f"  Libraries: {libs}\n\n"
+        "DO NOT use any other language or framework.\n"
+        "If language is JavaScript/Node.js, write JavaScript not Python.\n"
+        "If framework is Express.js, use Express.js not http.server."
+    )
+
+
+def _test_code_field_description(tech_stack: TechStackDocument) -> str:
+    tf = tech_stack.testing_framework.lower()
+    lang = tech_stack.language.lower()
+    if "vitest" in tf:
+        return "complete JavaScript test module using Vitest (import from vitest)"
+    if "jest" in tf:
+        return "complete JavaScript test module using Jest"
+    if "pytest" in tf or "python" in lang:
+        return "pytest module that imports from main and validates behaviour"
+    return f"test module using {tech_stack.testing_framework}"
 
 
 def _strip_json_fence(raw: str) -> str:
@@ -134,7 +181,13 @@ class BackendAgent(BaseAgent):
         )
         lesson_lines = [f"- {x.lesson.rule}" for x in ranked[:5]]
         lessons_block = "\n".join(lesson_lines) if lesson_lines else "(no prior lessons)"
+        tech_stack = await load_tech_stack_document(self.db, task.project_id)
         system_prompt = f"{BACKEND_ROLE_PROMPT}\n\nRelevant past lessons:\n{lessons_block}"
+        if tech_stack:
+            system_prompt += (
+                f'\n\nFor this project, "test_code" must be a '
+                f"{_test_code_field_description(tech_stack)}."
+            )
         contract_block = ""
         if api_contract:
             contract_block = (
@@ -143,7 +196,11 @@ class BackendAgent(BaseAgent):
                 "Your implementation must exactly match the API_Contract endpoint, method, "
                 "request schema, and response schema. Any deviation is a defect."
             )
+        tech_block = ""
+        if tech_stack:
+            tech_block = format_mandatory_tech_stack_block(tech_stack) + "\n\n"
         user_message = (
+            f"{tech_block}"
             f"Task:\n{task_description}\n\n"
             f"Master document context:\n{master_document_section}\n"
             f"{contract_block}"

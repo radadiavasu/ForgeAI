@@ -60,6 +60,52 @@ CONSTRAINTS = {
 ROOT_TITLE = "Build AppLayout — shared shell, NavBar, Footer"
 
 
+_RUN_LOG_FILENAME: str = ""
+_RUN_LOG_FILE = None
+
+
+def _init_run_logging() -> str:
+    """Tee stdout to a timestamped file under logs/ and return the log path."""
+    global _RUN_LOG_FILENAME, _RUN_LOG_FILE
+    from pathlib import Path
+
+    Path("logs").mkdir(exist_ok=True)
+    log_filename = f"logs/run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_file = open(log_filename, "a", encoding="utf-8")
+    _RUN_LOG_FILE = log_file
+
+    class Tee:
+        def __init__(self, *files):
+            self.files = files
+
+        def write(self, obj):
+            for f in self.files:
+                f.write(obj)
+                f.flush()
+
+        def flush(self):
+            for f in self.files:
+                f.flush()
+
+    sys.stdout = Tee(sys.__stdout__, log_file)
+    print(f"[LOG] Run started — saving to {log_filename}")
+    _RUN_LOG_FILENAME = log_filename
+    return log_filename
+
+
+def _save_planning_docs(bootstrap_result: object, log_filename: str) -> None:
+    """Write Master_Document, Tech_Stack, and recommendation after Run 1."""
+    docs_file = log_filename.replace(".log", "_docs.txt")
+    with open(docs_file, "w", encoding="utf-8") as f:
+        f.write("=== MASTER DOCUMENT ===\n")
+        f.write(str(bootstrap_result.master_document) + "\n\n")
+        f.write("=== TECH STACK DOCUMENT ===\n")
+        f.write(str(bootstrap_result.tech_stack_document) + "\n\n")
+        f.write("=== AGENT RECOMMENDATION ===\n")
+        f.write(str(bootstrap_result.recommendation) + "\n")
+    print(f"[LOG] Planning docs saved to {docs_file}")
+
+
 def _configure_logging() -> None:
     logging.basicConfig(level=logging.INFO)
 
@@ -1199,6 +1245,7 @@ async def async_main() -> None:
     try:
         async with AsyncSessionFactory() as session:
             project_id, result = await _run1_bootstrap(session, llm, memory)
+            _save_planning_docs(result, _RUN_LOG_FILENAME)
             try:
                 layout = await _run2_layout(session, llm, memory, result.master_document, project_id)
             except Exception:
@@ -1269,10 +1316,49 @@ async def async_main() -> None:
         raise
 
 
+async def run_inspect_only() -> None:
+    """Run planning only (bootstrap, layout, navigation) and stop before frontend work."""
+    _init_run_logging()
+    settings = get_settings()
+    if not settings.anthropic_api_key.strip():
+        print("[FORGEAI] Set ANTHROPIC_API_KEY in .env for real LLM runs.", file=sys.stderr)
+        raise SystemExit(1)
+    pool = ModelPool.from_env()
+    router = ModelRouter(pool)
+    tm = TaskMemory(settings.redis_url, ttl_seconds=settings.task_memory_ttl)
+    memory = AgentMemory(settings.chroma_host, settings.chroma_port)
+    llm = LLMClient(settings.anthropic_api_key, router)
+    llm.context_manager = ContextWindowManager(llm, tm)
+
+    try:
+        async with AsyncSessionFactory() as session:
+            project_id, result = await _run1_bootstrap(session, llm, memory)
+            _save_planning_docs(result, _RUN_LOG_FILENAME)
+            try:
+                layout = await _run2_layout(session, llm, memory, result.master_document, project_id)
+            except Exception:
+                layout = _fallback_layout(project_id)
+                print("[LAYOUT] Using deterministic fallback layout after generation/review error")
+            await _run3_navigation(session, llm, memory, layout, project_id)
+            print("=== INSPECTION COMPLETE — stopped before frontend ===")
+    except Exception as e:
+        if _connection_refused(e):
+            _print_database_help()
+            raise SystemExit(1) from e
+        raise
+
+
 def main() -> None:
+    _init_run_logging()
     _configure_logging()
     asyncio.run(async_main())
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    if "--inspect" in sys.argv:
+        _configure_logging()
+        asyncio.run(run_inspect_only())
+    else:
+        main()

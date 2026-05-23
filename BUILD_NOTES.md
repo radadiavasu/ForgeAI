@@ -174,3 +174,37 @@ Each agent task generates standalone code with no shared context.
 Backend files use http.server stdlib, not FastAPI.
 No shared database connection between files.
 Code quality improvement deferred to Phase 11.
+
+------
+
+## Phase 11 Discoveries
+
+### 1. Tech stack not injected into agent prompts (root cause found)
+Research_Agent and Architect_Agent produce high-quality documents.
+The problem was backend agents ignoring Tech_Stack_Document.
+Fix: injected mandatory tech stack constraint at top of every
+backend agent code generation prompt.
+Result: agents now generate JavaScript/Express.js instead of Python.
+
+### 2. Task decomposition was generic
+Tasks titled "Backend task 7" with description "Phase-locked
+backend work" gave agents no context.
+Fix: Lead_Agent now derives task titles from Master_Document
+API surfaces — "Implement GET /tasks endpoint" etc.
+
+### 3. QA test framework mismatch
+QA generated pytest tests for Express.js code.
+Fix: QA now reads testing_framework from Tech_Stack_Document
+and generates Vitest tests for JavaScript projects.
+
+### 4. Run logging added
+Every main.py run saves complete output to logs/ directory.
+File format: logs/run_YYYYMMDD_HHMMSS.log
+Planning docs saved to: logs/run_YYYYMMDD_HHMMSS_docs.txt
+logs/ is gitignored.
+
+### 5. Langfuse deferred to Phase 12
+Langfuse is the right LLM observability tool for ForgeAI.
+Wraps LLMClient.complete() in forgeai/llm/client.py.
+Deferred until Phase 12 (production deployment).
+Reads LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY from .env.
