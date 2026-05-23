@@ -58,17 +58,17 @@ async def load_tech_stack_document(db_session, project_id: uuid.UUID) -> TechSta
 
 def format_critical_language_block(tech_stack: TechStackDocument) -> str:
     """Explicit language/framework guard placed immediately before the task description."""
-    lang = tech_stack.language.lower()
-    if "javascript" not in lang and "typescript" not in lang:
-        return ""
+    lang = tech_stack.language
     framework = tech_stack.framework
-    return (
-        f"CRITICAL: You are generating {tech_stack.language} code.\n"
-        f"Framework: {framework}\n"
-        f"You MUST write JavaScript/TypeScript using {framework}.\n"
-        "DO NOT write Python. DO NOT use http.server, Flask, or FastAPI.\n"
-        "File extension must be .js or .ts, NOT .py"
-    )
+    return f"""CRITICAL: You are generating {lang} code.
+Framework: {framework}
+You MUST write code using {framework}.
+DO NOT deviate from the specified language and framework.
+File extension must match the language:
+  JavaScript/TypeScript → .js or .ts
+  Python → .py
+  Other → appropriate extension for {lang}
+""".strip()
 
 
 def format_mandatory_tech_stack_block(tech_stack: TechStackDocument) -> str:
