@@ -31,7 +31,7 @@ from forgeai.bootstrap.schemas import (
 )
 from forgeai.contracts.navigation import NavigationNegotiator
 from forgeai.contracts.registry import ComponentRegistry
-from forgeai.contracts.schemas import LayoutSpecification, NavigationContract, PageSpec
+from forgeai.contracts.schemas import LayoutSpecification, NavigationContract, PageSpec, RouteDefinition
 from forgeai.escalation.ladder import EscalationLadder
 from forgeai.escalation.loop_counter import LoopCounter
 from forgeai.escalation.persistence import EscalationPersistence
@@ -47,7 +47,7 @@ from forgeai.orchestration.schemas import (
     QADecision,
 )
 from forgeai.llm.client import LLMClient
-from forgeai.llm.schemas import MasterDocument, TechStackDocument
+from forgeai.llm.schemas import APISurface, Component, MasterDocument, TechStackDocument
 from forgeai.memory.agent_memory import AgentMemory
 from forgeai.memory.task_memory import TaskMemory
 from forgeai.models.agent_lifecycle import AgentLifecycleEventModel
@@ -62,6 +62,18 @@ logger = logging.getLogger(__name__)
 ROOT_LAYOUT_TASK_TITLE = "Build AppLayout — shared shell, NavBar, Footer"
 FRONTEND_SHELL_TASK_TITLE = "Create frontend app shell"
 BACKEND_SERVER_TASK_TITLE = "Create backend server entry point"
+HISTORY_PAGE_TASK_TITLE = "Create History page"
+API_CLIENT_TASK_TITLE = "Create API client module"
+DATABASE_MIGRATION_TASK_TITLE = "Create database migration"
+DOCKER_COMPOSE_TASK_TITLE = "Create Docker Compose"
+BACKEND_DOCKERFILE_TASK_TITLE = "Create backend Dockerfile"
+FRONTEND_DOCKERFILE_TASK_TITLE = "Create frontend Dockerfile"
+
+
+def _task_title_substring_exists(existing_titles: list[str], needle: str) -> bool:
+    """Return True if any existing title contains needle (case-insensitive)."""
+    needle_lower = needle.lower()
+    return any(needle_lower in title.lower() for title in existing_titles)
 
 
 def load_skill(skill_name: str) -> str:
@@ -121,16 +133,14 @@ def _backend_server_task_description(
         f"  {s.method} {s.endpoint} — {s.description}"
         for s in master_doc.api_surfaces
     )
-    return f"""Create the complete backend server
-entry point so the server starts with:
-  npm install && npm start
+    return f"""Create the complete backend server entry point.
 
 Tech stack: {tech_stack.language}
 Framework: {tech_stack.framework}
 Database: {tech_stack.database}
 Libraries: {', '.join(tech_stack.libraries)}
 
-API endpoints to wire up in routes/index.js:
+API endpoints to wire up:
 {endpoint_lines}
 {skill_section}
 """
@@ -145,15 +155,13 @@ def _frontend_shell_task_description(
     route_lines = "\n".join(
         f"  {r.path} → {r.component_name}" for r in nav.routes
     )
-    return f"""Create the complete frontend application
-entry point so the app is buildable with:
-  npm install && npm run build
+    return f"""Create the complete frontend application entry point.
 
 Tech stack: {tech_stack.language}
 Framework: {tech_stack.framework}
 Libraries: {', '.join(tech_stack.libraries)}
 
-Routes to wire in App.jsx:
+Routes to wire:
 {route_lines}
 {skill_section}
 """
@@ -267,6 +275,281 @@ def _frontend_tasks_from_navigation(
                 dependencies=[ROOT_LAYOUT_TASK_TITLE],
             )
         )
+    return tasks
+
+
+def _history_page_task_description(
+    master_document: MasterDocument,
+    tech_stack: TechStackDocument,
+    history_route: RouteDefinition,
+    history_endpoint: APISurface,
+) -> str:
+    frontend_criteria = chr(10).join(
+        line
+        for c in master_document.components
+        if "frontend" in c.name.lower()
+        for line in c.acceptance_criteria
+    )
+    return f"""Build the {history_route.component_name}
+component showing completed tasks.
+
+Tech stack: {tech_stack.language}
+Framework: {tech_stack.framework}
+
+Fetch data from: {history_endpoint.method} {history_endpoint.endpoint}
+Response schema: {history_endpoint.response_schema}
+
+Requirements from Master Document:
+{frontend_criteria}"""
+
+
+def _api_client_task_description(
+    master_document: MasterDocument,
+    tech_stack: TechStackDocument,
+) -> str:
+    frontend_skill = select_frontend_skill(tech_stack)
+    endpoint_lines = chr(10).join(
+        f"  {s.method} {s.endpoint} — {s.description}"
+        for s in master_document.api_surfaces
+    )
+    return f"""Create a centralised API client module
+that wraps all backend endpoint calls.
+
+Tech stack: {tech_stack.language}
+Framework: {tech_stack.framework}
+
+Endpoints to wrap:
+{endpoint_lines}
+
+Requirements:
+- One exported function per endpoint
+- Handle loading and error states
+- Read API base URL from environment
+- No hardcoded URLs
+
+{frontend_skill}"""
+
+
+def _database_migration_task_description(
+    master_document: MasterDocument,
+    tech_stack: TechStackDocument,
+    db_component: Component,
+) -> str:
+    model_lines = chr(10).join(
+        f"  {m.name}: "
+        + ", ".join(f"{f.name}({f.type})" for f in m.fields)
+        for m in master_document.data_models
+    )
+    criteria_lines = chr(10).join(db_component.acceptance_criteria)
+    backend_skill = select_backend_skill(tech_stack)
+    return f"""Create database migration scripts for
+{tech_stack.database}.
+
+Data models to implement:
+{model_lines}
+
+Acceptance criteria:
+{criteria_lines}
+
+{backend_skill}"""
+
+
+def _docker_compose_task_description(
+    master_document: MasterDocument,
+    tech_stack: TechStackDocument,
+    docker_component: Component,
+) -> str:
+    component_lines = chr(10).join(
+        f"  {c.name}" for c in master_document.components
+    )
+    criteria_lines = chr(10).join(docker_component.acceptance_criteria)
+    return f"""Create Docker Compose configuration
+wiring all services.
+
+Components to orchestrate:
+{component_lines}
+
+Database: {tech_stack.database}
+
+Acceptance criteria:
+{criteria_lines}"""
+
+
+def _backend_dockerfile_task_description(tech_stack: TechStackDocument) -> str:
+    backend_skill = select_backend_skill(tech_stack)
+    return f"""Create Dockerfile for the backend service.
+
+Tech stack: {tech_stack.language}
+Framework: {tech_stack.framework}
+
+Requirements:
+- Multi-stage build
+- Minimal production image
+- Read configuration from environment variables only
+- No hardcoded secrets or ports
+
+{backend_skill}"""
+
+
+def _frontend_dockerfile_task_description(tech_stack: TechStackDocument) -> str:
+    frontend_skill = select_frontend_skill(tech_stack)
+    return f"""Create Dockerfile for the frontend service.
+
+Tech stack: {tech_stack.language}
+Framework: {tech_stack.framework}
+
+Requirements:
+- Stage 1: build the frontend application
+- Stage 2: serve static files with a lightweight web server
+- No hardcoded ports
+- Read configuration from environment variables
+
+{frontend_skill}"""
+
+
+def _missing_tasks_from_documents(
+    master_document: MasterDocument,
+    tech_stack: TechStackDocument,
+    navigation_contract: NavigationContract | None,
+    existing_titles: list[str],
+) -> list[TaskSpec]:
+    """Build supplemental tasks from Master Document artefacts after decomposition."""
+    tasks: list[TaskSpec] = []
+    titles = list(existing_titles)
+
+    if navigation_contract is not None:
+        history_route = next(
+            (
+                r
+                for r in navigation_contract.routes
+                if "history" in r.path.lower()
+            ),
+            None,
+        )
+        if (
+            history_route is not None
+            and not _task_title_substring_exists(titles, "history")
+            and master_document.api_surfaces
+        ):
+            history_endpoint = next(
+                (
+                    s
+                    for s in master_document.api_surfaces
+                    if "history" in s.endpoint.lower()
+                    or (
+                        "complete" in s.endpoint.lower()
+                        and s.method.upper() == "GET"
+                    )
+                ),
+                master_document.api_surfaces[0],
+            )
+            tasks.append(
+                TaskSpec(
+                    title=HISTORY_PAGE_TASK_TITLE,
+                    description=_history_page_task_description(
+                        master_document,
+                        tech_stack,
+                        history_route,
+                        history_endpoint,
+                    ).strip(),
+                    complexity="MEDIUM",
+                    phase="FRONTEND_PHASE",
+                    dependencies=[ROOT_LAYOUT_TASK_TITLE],
+                )
+            )
+            titles.append(HISTORY_PAGE_TASK_TITLE)
+
+        if not _task_title_substring_exists(titles, "api client"):
+            tasks.append(
+                TaskSpec(
+                    title=API_CLIENT_TASK_TITLE,
+                    description=_api_client_task_description(
+                        master_document, tech_stack
+                    ).strip(),
+                    complexity="MEDIUM",
+                    phase="FRONTEND_PHASE",
+                    dependencies=[ROOT_LAYOUT_TASK_TITLE],
+                )
+            )
+            titles.append(API_CLIENT_TASK_TITLE)
+
+    db_component = next(
+        (c for c in master_document.components if "database" in c.name.lower()),
+        None,
+    )
+    if db_component is not None and not _task_title_substring_exists(
+        titles, "migration"
+    ):
+        backend_deps = (
+            [BACKEND_SERVER_TASK_TITLE]
+            if BACKEND_SERVER_TASK_TITLE in titles
+            else []
+        )
+        tasks.append(
+            TaskSpec(
+                title=DATABASE_MIGRATION_TASK_TITLE,
+                description=_database_migration_task_description(
+                    master_document, tech_stack, db_component
+                ).strip(),
+                complexity="HIGH",
+                phase="BACKEND_PHASE",
+                dependencies=backend_deps,
+            )
+        )
+        titles.append(DATABASE_MIGRATION_TASK_TITLE)
+
+    docker_component = next(
+        (
+            c
+            for c in master_document.components
+            if "docker" in c.name.lower() or "compose" in c.name.lower()
+        ),
+        None,
+    )
+    if docker_component is not None and not _task_title_substring_exists(
+        titles, "docker compose"
+    ):
+        tasks.append(
+            TaskSpec(
+                title=DOCKER_COMPOSE_TASK_TITLE,
+                description=_docker_compose_task_description(
+                    master_document, tech_stack, docker_component
+                ).strip(),
+                complexity="MEDIUM",
+                phase="BACKEND_PHASE",
+                dependencies=[],
+            )
+        )
+        titles.append(DOCKER_COMPOSE_TASK_TITLE)
+
+    if not _task_title_substring_exists(titles, "backend dockerfile"):
+        tasks.append(
+            TaskSpec(
+                title=BACKEND_DOCKERFILE_TASK_TITLE,
+                description=_backend_dockerfile_task_description(
+                    tech_stack
+                ).strip(),
+                complexity="MEDIUM",
+                phase="BACKEND_PHASE",
+                dependencies=[],
+            )
+        )
+        titles.append(BACKEND_DOCKERFILE_TASK_TITLE)
+
+    if not _task_title_substring_exists(titles, "frontend dockerfile"):
+        tasks.append(
+            TaskSpec(
+                title=FRONTEND_DOCKERFILE_TASK_TITLE,
+                description=_frontend_dockerfile_task_description(
+                    tech_stack
+                ).strip(),
+                complexity="MEDIUM",
+                phase="BACKEND_PHASE",
+                dependencies=[],
+            )
+        )
+        titles.append(FRONTEND_DOCKERFILE_TASK_TITLE)
+
     return tasks
 
 
@@ -622,6 +905,17 @@ class LeadAgent(BaseAgent):
         else:
             frontend_tasks = list(default_plan.frontend_tasks)
 
+        tech_doc = _tech_stack_document_from_master(master_doc)
+        plan_titles = [t.title for t in frontend_tasks + backend_tasks]
+        for spec in _missing_tasks_from_documents(
+            master_doc, tech_doc, navigation_contract, plan_titles
+        ):
+            if spec.phase == "FRONTEND_PHASE":
+                frontend_tasks.append(spec)
+            else:
+                backend_tasks.append(spec)
+            plan_titles.append(spec.title)
+
         total = len(frontend_tasks) + len(backend_tasks)
         return TaskPlan(
             frontend_tasks=frontend_tasks,
@@ -664,23 +958,36 @@ class LeadAgent(BaseAgent):
             return None
         return TechStackDocument.model_validate(row.content)
 
-    async def create_backend_tasks_from_master_document(
+    async def create_missing_tasks_after_decomposition(
         self,
         project_id: uuid.UUID,
         master_document: MasterDocument,
         *,
-        assigned_agent: str = "backend_agent_1",
+        navigation_contract: NavigationContract | None = None,
+        tech_stack: TechStackDocument | None = None,
+        frontend_agent: str = "frontend_agent_1",
+        backend_agent: str = "backend_agent_1",
     ) -> list[Task]:
-        """Create backend server entry point then one task per API surface."""
-        if not master_document.api_surfaces:
-            return []
-
-        tech_stack = await self._load_tech_stack_document_for_project(project_id)
+        """Create supplemental tasks from Master Document after primary decomposition."""
         if tech_stack is None:
-            tech_stack = _tech_stack_document_from_master(master_document)
+            tech_stack = await self._load_tech_stack_document_for_project(project_id)
+            if tech_stack is None:
+                tech_stack = _tech_stack_document_from_master(master_document)
+
+        res = await self.db.execute(
+            select(Task.title).where(Task.project_id == project_id)
+        )
+        existing_titles = [row[0] for row in res.all()]
+
+        specs = _missing_tasks_from_documents(
+            master_document,
+            tech_stack,
+            navigation_contract,
+            existing_titles,
+        )
 
         created: list[Task] = []
-        for spec in _backend_tasks_from_master_doc(master_document, tech_stack):
+        for spec in specs:
             exists = (
                 await self.db.execute(
                     select(Task).where(
@@ -691,15 +998,65 @@ class LeadAgent(BaseAgent):
             ).scalar_one_or_none()
             if exists is not None:
                 continue
+            agent = (
+                frontend_agent if spec.phase == "FRONTEND_PHASE" else backend_agent
+            )
             task = await self.create_task(
                 title=spec.title,
                 description=spec.description,
                 complexity=TaskComplexity[spec.complexity],
-                assigned_agent=assigned_agent,
+                assigned_agent=agent,
                 project_id=project_id,
                 dependency_titles=spec.dependencies or None,
             )
             created.append(task)
+            existing_titles.append(spec.title)
+        return created
+
+    async def create_backend_tasks_from_master_document(
+        self,
+        project_id: uuid.UUID,
+        master_document: MasterDocument,
+        *,
+        navigation_contract: NavigationContract | None = None,
+        assigned_agent: str = "backend_agent_1",
+    ) -> list[Task]:
+        """Create backend server entry point then one task per API surface."""
+        tech_stack = await self._load_tech_stack_document_for_project(project_id)
+        if tech_stack is None:
+            tech_stack = _tech_stack_document_from_master(master_document)
+
+        created: list[Task] = []
+        if master_document.api_surfaces:
+            for spec in _backend_tasks_from_master_doc(master_document, tech_stack):
+                exists = (
+                    await self.db.execute(
+                        select(Task).where(
+                            Task.project_id == project_id,
+                            Task.title == spec.title,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if exists is not None:
+                    continue
+                task = await self.create_task(
+                    title=spec.title,
+                    description=spec.description,
+                    complexity=TaskComplexity[spec.complexity],
+                    assigned_agent=assigned_agent,
+                    project_id=project_id,
+                    dependency_titles=spec.dependencies or None,
+                )
+                created.append(task)
+        created.extend(
+            await self.create_missing_tasks_after_decomposition(
+                project_id,
+                master_document,
+                navigation_contract=navigation_contract,
+                tech_stack=tech_stack,
+                backend_agent=assigned_agent,
+            )
+        )
         return created
 
     async def create_frontend_tasks_from_navigation(
@@ -739,6 +1096,17 @@ class LeadAgent(BaseAgent):
                 dependency_titles=spec.dependencies or None,
             )
             created.append(task)
+        master = await self._load_master_document_for_project(project_id)
+        if master is not None:
+            created.extend(
+                await self.create_missing_tasks_after_decomposition(
+                    project_id,
+                    master,
+                    navigation_contract=navigation_contract,
+                    tech_stack=tech_stack,
+                    frontend_agent=assigned_agent,
+                )
+            )
         return created
 
     async def initiate_navigation_contract(
@@ -994,6 +1362,7 @@ class LeadAgent(BaseAgent):
             or "component" in t.title.lower()
             or "AppLayout" in t.title
             or "frontend app shell" in t.title.lower()
+            or "api client" in t.title.lower()
         ]
         shell_tasks = [t for t in frontend_tasks if t.title == shell_title]
         root_tasks = [t for t in frontend_tasks if t.title == root_title]
@@ -1120,7 +1489,7 @@ class LeadAgent(BaseAgent):
         if master is not None:
             n = len(
                 await self.create_backend_tasks_from_master_document(
-                    project_id, master
+                    project_id, master, navigation_contract=navigation_contract
                 )
             )
             if n:
