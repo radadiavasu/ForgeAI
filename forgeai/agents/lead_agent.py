@@ -9,6 +9,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel as PydanticBaseModel
@@ -59,6 +60,103 @@ from forgeai.state_machine.transitions import KEY_METADATA, KEY_PHASE_APPROVAL, 
 logger = logging.getLogger(__name__)
 
 ROOT_LAYOUT_TASK_TITLE = "Build AppLayout — shared shell, NavBar, Footer"
+FRONTEND_SHELL_TASK_TITLE = "Create frontend app shell"
+BACKEND_SERVER_TASK_TITLE = "Create backend server entry point"
+
+
+def load_skill(skill_name: str) -> str:
+    """Load a skill file from the skills directory."""
+    skill_path = Path(f"skills/{skill_name}/SKILL.md")
+    if skill_path.exists():
+        return skill_path.read_text(encoding="utf-8")
+    return ""
+
+
+def select_backend_skill(tech_stack: TechStackDocument) -> str:
+    """Dynamically select backend skill based on tech stack."""
+    framework = tech_stack.framework.lower()
+    if "express" in framework:
+        return load_skill("express-server")
+    if "fastapi" in framework:
+        return load_skill("fastapi-server")
+    if "django" in framework:
+        return load_skill("django-server")
+    return ""
+
+
+def select_frontend_skill(tech_stack: TechStackDocument) -> str:
+    """Dynamically select frontend skill based on tech stack."""
+    libraries = " ".join(tech_stack.libraries).lower()
+    framework = tech_stack.framework.lower()
+    if "react" in libraries or "react" in framework:
+        if "vite" in libraries:
+            return load_skill("react-vite-app")
+    if "next" in framework:
+        return load_skill("nextjs-app")
+    if "vue" in libraries:
+        return load_skill("vue-vite-app")
+    return ""
+
+
+def _tech_stack_document_from_master(master_doc: MasterDocument) -> TechStackDocument:
+    ts = master_doc.tech_stack
+    return TechStackDocument(
+        language=ts.language,
+        framework=ts.framework,
+        database=ts.database,
+        testing_framework=ts.testing_framework,
+        libraries=list(getattr(ts, "libraries", []) or []),
+        rationale=ts.rationale,
+        rejected_alternatives=list(getattr(ts, "rejected_alternatives", []) or []),
+    )
+
+
+def _backend_server_task_description(
+    master_doc: MasterDocument,
+    tech_stack: TechStackDocument,
+) -> str:
+    backend_skill = select_backend_skill(tech_stack)
+    skill_section = f"\n\nSKILL REFERENCE:\n{backend_skill}" if backend_skill else ""
+    endpoint_lines = "\n".join(
+        f"  {s.method} {s.endpoint} — {s.description}"
+        for s in master_doc.api_surfaces
+    )
+    return f"""Create the complete backend server
+entry point so the server starts with:
+  npm install && npm start
+
+Tech stack: {tech_stack.language}
+Framework: {tech_stack.framework}
+Database: {tech_stack.database}
+Libraries: {', '.join(tech_stack.libraries)}
+
+API endpoints to wire up in routes/index.js:
+{endpoint_lines}
+{skill_section}
+"""
+
+
+def _frontend_shell_task_description(
+    nav: NavigationContract,
+    tech_stack: TechStackDocument,
+) -> str:
+    frontend_skill = select_frontend_skill(tech_stack)
+    skill_section = f"\n\nSKILL REFERENCE:\n{frontend_skill}" if frontend_skill else ""
+    route_lines = "\n".join(
+        f"  {r.path} → {r.component_name}" for r in nav.routes
+    )
+    return f"""Create the complete frontend application
+entry point so the app is buildable with:
+  npm install && npm run build
+
+Tech stack: {tech_stack.language}
+Framework: {tech_stack.framework}
+Libraries: {', '.join(tech_stack.libraries)}
+
+Routes to wire in App.jsx:
+{route_lines}
+{skill_section}
+"""
 
 
 def _backend_endpoint_task_title(method: str, path: str) -> str:
@@ -70,9 +168,26 @@ def _backend_endpoint_task_title(method: str, path: str) -> str:
     return f"Implement {verb} {route}"
 
 
-def _backend_tasks_from_master_doc(master_doc: MasterDocument) -> list[TaskSpec]:
-    """One backend task per API surface in the Master_Document."""
+def _backend_tasks_from_master_doc(
+    master_doc: MasterDocument,
+    tech_stack: TechStackDocument | None = None,
+) -> list[TaskSpec]:
+    """Backend server entry point first, then one task per API surface."""
+    if not master_doc.api_surfaces:
+        return []
+
     tasks: list[TaskSpec] = []
+    if tech_stack is not None:
+        tasks.append(
+            TaskSpec(
+                title=BACKEND_SERVER_TASK_TITLE,
+                description=_backend_server_task_description(master_doc, tech_stack).strip(),
+                complexity="HIGH",
+                phase="BACKEND_PHASE",
+                dependencies=[],
+            )
+        )
+    endpoint_deps = [BACKEND_SERVER_TASK_TITLE] if tech_stack is not None else []
     for surface in master_doc.api_surfaces:
         title = f"Implement {surface.method} {surface.endpoint}"
         desc = (surface.description or "").strip() or title
@@ -82,7 +197,7 @@ def _backend_tasks_from_master_doc(master_doc: MasterDocument) -> list[TaskSpec]
                 description=desc,
                 complexity="MEDIUM",
                 phase="BACKEND_PHASE",
-                dependencies=[],
+                dependencies=list(endpoint_deps),
             )
         )
     return tasks
@@ -102,17 +217,35 @@ def _numbered_backend_tasks(count: int) -> list[TaskSpec]:
     ]
 
 
-def _frontend_tasks_from_navigation(nav: NavigationContract) -> list[TaskSpec]:
-    """Frontend tasks from Navigation_Contract component names."""
-    tasks: list[TaskSpec] = [
+def _frontend_tasks_from_navigation(
+    nav: NavigationContract,
+    tech_stack: TechStackDocument | None = None,
+) -> list[TaskSpec]:
+    """Frontend tasks: app shell first, then layout, then page components."""
+    tasks: list[TaskSpec] = []
+    shell_deps: list[str] = []
+
+    if tech_stack is not None:
+        tasks.append(
+            TaskSpec(
+                title=FRONTEND_SHELL_TASK_TITLE,
+                description=_frontend_shell_task_description(nav, tech_stack).strip(),
+                complexity="HIGH",
+                phase="FRONTEND_PHASE",
+                dependencies=[],
+            )
+        )
+        shell_deps = [FRONTEND_SHELL_TASK_TITLE]
+
+    tasks.append(
         TaskSpec(
             title=ROOT_LAYOUT_TASK_TITLE,
             description="Root layout and shared navigation shell.",
             complexity="MEDIUM",
             phase="FRONTEND_PHASE",
-            dependencies=[],
+            dependencies=list(shell_deps),
         )
-    ]
+    )
     seen: set[str] = set()
     layout_key = (nav.shared_layout_component or "AppLayout").strip().lower()
     for route in nav.routes:
@@ -472,7 +605,8 @@ class LeadAgent(BaseAgent):
             )
 
         if use_api_backend:
-            backend_tasks = _backend_tasks_from_master_doc(master_doc)
+            tech_doc = _tech_stack_document_from_master(master_doc)
+            backend_tasks = _backend_tasks_from_master_doc(master_doc, tech_doc)
         elif llm_plan is not None and llm_plan.backend_tasks:
             backend_tasks = llm_plan.backend_tasks
         elif default_plan.backend_tasks:
@@ -481,7 +615,8 @@ class LeadAgent(BaseAgent):
             backend_tasks = _numbered_backend_tasks(1)
 
         if use_nav_frontend:
-            frontend_tasks = _frontend_tasks_from_navigation(navigation_contract)
+            tech_doc = _tech_stack_document_from_master(master_doc)
+            frontend_tasks = _frontend_tasks_from_navigation(navigation_contract, tech_doc)
         elif llm_plan is not None and llm_plan.frontend_tasks:
             frontend_tasks = llm_plan.frontend_tasks
         else:
@@ -513,6 +648,22 @@ class LeadAgent(BaseAgent):
             return None
         return MasterDocument.model_validate(row.content)
 
+    async def _load_tech_stack_document_for_project(
+        self, project_id: uuid.UUID
+    ) -> TechStackDocument | None:
+        row = (
+            await self.db.execute(
+                select(ProjectArtefactModel).where(
+                    ProjectArtefactModel.project_id == project_id,
+                    ProjectArtefactModel.artefact_type == "tech_stack_document",
+                    ProjectArtefactModel.is_current.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        return TechStackDocument.model_validate(row.content)
+
     async def create_backend_tasks_from_master_document(
         self,
         project_id: uuid.UUID,
@@ -520,12 +671,16 @@ class LeadAgent(BaseAgent):
         *,
         assigned_agent: str = "backend_agent_1",
     ) -> list[Task]:
-        """Create one PHASE_LOCKED backend task per Master_Document API surface."""
+        """Create backend server entry point then one task per API surface."""
         if not master_document.api_surfaces:
             return []
 
+        tech_stack = await self._load_tech_stack_document_for_project(project_id)
+        if tech_stack is None:
+            tech_stack = _tech_stack_document_from_master(master_document)
+
         created: list[Task] = []
-        for spec in _backend_tasks_from_master_doc(master_document):
+        for spec in _backend_tasks_from_master_doc(master_document, tech_stack):
             exists = (
                 await self.db.execute(
                     select(Task).where(
@@ -542,6 +697,46 @@ class LeadAgent(BaseAgent):
                 complexity=TaskComplexity[spec.complexity],
                 assigned_agent=assigned_agent,
                 project_id=project_id,
+                dependency_titles=spec.dependencies or None,
+            )
+            created.append(task)
+        return created
+
+    async def create_frontend_tasks_from_navigation(
+        self,
+        project_id: uuid.UUID,
+        navigation_contract: NavigationContract,
+        tech_stack: TechStackDocument | None = None,
+        *,
+        assigned_agent: str = "frontend_agent_1",
+    ) -> list[Task]:
+        """Create frontend app shell, layout, and page tasks from navigation contract."""
+        if tech_stack is None:
+            tech_stack = await self._load_tech_stack_document_for_project(project_id)
+
+        created: list[Task] = []
+        for spec in _frontend_tasks_from_navigation(navigation_contract, tech_stack):
+            exists = (
+                await self.db.execute(
+                    select(Task).where(
+                        Task.project_id == project_id,
+                        Task.title == spec.title,
+                    )
+                )
+            ).scalar_one_or_none()
+            if exists is not None:
+                continue
+            agent = assigned_agent
+            if spec.title != FRONTEND_SHELL_TASK_TITLE and spec.title != ROOT_LAYOUT_TASK_TITLE:
+                if "Dashboard" in spec.title or "Settings" in spec.title:
+                    agent = "frontend_agent_2"
+            task = await self.create_task(
+                title=spec.title,
+                description=spec.description,
+                complexity=TaskComplexity[spec.complexity],
+                assigned_agent=agent,
+                project_id=project_id,
+                dependency_titles=spec.dependencies or None,
             )
             created.append(task)
         return created
@@ -781,7 +976,11 @@ class LeadAgent(BaseAgent):
             )
 
         fe_by_id = {a.agent_id: a for a in frontend_agents}
-        root_title = "Build AppLayout — shared shell, NavBar, Footer"
+        root_title = ROOT_LAYOUT_TASK_TITLE
+        shell_title = FRONTEND_SHELL_TASK_TITLE
+        await self.create_frontend_tasks_from_navigation(
+            project_id, navigation_contract
+        )
         res = await self.db.execute(
             select(Task).where(Task.project_id == project_id)
         )
@@ -789,12 +988,18 @@ class LeadAgent(BaseAgent):
         frontend_tasks = [
             t
             for t in all_tasks
-            if t.title == root_title
+            if t.title == shell_title
+            or t.title == root_title
             or "page" in t.title.lower()
+            or "component" in t.title.lower()
             or "AppLayout" in t.title
+            or "frontend app shell" in t.title.lower()
         ]
+        shell_tasks = [t for t in frontend_tasks if t.title == shell_title]
         root_tasks = [t for t in frontend_tasks if t.title == root_title]
-        other_tasks = [t for t in frontend_tasks if t.title != root_title]
+        other_tasks = [
+            t for t in frontend_tasks if t.title not in (shell_title, root_title)
+        ]
 
         completed: list[str] = []
         qa_cycles = 0
@@ -867,6 +1072,11 @@ class LeadAgent(BaseAgent):
                 bundle = react_code if development_phase == "FRONTEND_PHASE" else (
                     f"GENERATED_UI = {json.dumps(react_code)}\n"
                 )
+
+        for shell in shell_tasks:
+            page = next((p for p in layout_spec.pages if p.route == "/"), layout_spec.pages[0])
+            await _run_task_cycle(shell, page)
+            await self.unlock_dependent_tasks(shell_title, project_id)
 
         for root in root_tasks:
             page = next((p for p in layout_spec.pages if p.route == "/"), layout_spec.pages[0])

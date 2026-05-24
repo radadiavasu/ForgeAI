@@ -41,6 +41,13 @@ _QA_PLACEHOLDER_OUTPUTS = frozenset(
     {"qa approved", "done", "ok", "patch verified", "change rework complete", "new change task complete"}
 )
 
+_FORGEAI_SOURCE_MARKERS = (
+    "asyncio.run(main())",
+    "run_inspect_only",
+    "BOOTSTRAP PROTOCOL",
+    "ForgeAI pipeline",
+)
+
 COMPOSE_PROMPT = """
 Generate docker-compose.yml for the tech stack.
 Include app service, database service when PostgreSQL is used, health checks,
@@ -188,6 +195,18 @@ class PackageAssembler:
             if not content.strip() or self._is_placeholder_output(content):
                 content = f"# Task: {task.title}\n# Output not captured\n"
 
+            if self._is_forgeai_pipeline_source(content):
+                logger.warning(
+                    "Skipping write for %s (task %s): content matches ForgeAI pipeline source",
+                    rel_path,
+                    task.id,
+                )
+                print(
+                    f"[DELIVERY] SKIP {rel_path} — detected ForgeAI pipeline source, "
+                    "not generated project code"
+                )
+                continue
+
             file_path.write_text(content, encoding="utf-8")
             nbytes = len(content.encode("utf-8"))
             logger.info("Writing %s (%d bytes)", rel_path, nbytes)
@@ -202,8 +221,6 @@ class PackageAssembler:
             )
 
         self._write_requirements_txt(root, tech_stack, has_backend)
-        if has_backend:
-            self._ensure_api_entrypoint(root)
 
         dockerfile = await self._generate_dockerfile(
             tech_stack, str(root), has_frontend=has_frontend, has_backend=has_backend
@@ -540,6 +557,10 @@ class PackageAssembler:
             return True
         return lower.endswith(" ok") and len(lower) < 80
 
+    def _is_forgeai_pipeline_source(self, content: str) -> bool:
+        """True when content looks like ForgeAI's own main.py / pipeline, not agent output."""
+        return any(marker in content for marker in _FORGEAI_SOURCE_MARKERS)
+
     def _parse_work_output(self, raw: str, task: Task) -> str:
         """Normalize stored output (plain code or JSON bundle)."""
         stripped = raw.strip()
@@ -599,26 +620,6 @@ class PackageAssembler:
         if "postgres" in tech_stack.database.lower():
             lines.append("psycopg2-binary>=2.9.9")
         (root / "requirements.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    def _ensure_api_entrypoint(self, root: Path) -> None:
-        main_py = root / "src" / "api" / "main.py"
-        if main_py.exists():
-            return
-        api_files = sorted(p.name for p in (root / "src" / "api").glob("*.py") if p.name != "main.py")
-        imports = ""
-        routes = ""
-        if api_files:
-            mod = api_files[0].replace(".py", "")
-            imports = f"from src.api import {mod}\n"
-            routes = f"\n@app.get('/health')\ndef health():\n    return {{'status': 'ok'}}\n"
-        main_py.write_text(
-            f"""from fastapi import FastAPI\n{imports}\napp = FastAPI(title='ForgeAI App')\n{routes}\n
-if __name__ == '__main__':
-    import uvicorn
-    uvicorn.run(app, host='0.0.0.0', port=8000)
-""",
-            encoding="utf-8",
-        )
 
     def _dockerfile_python_only(self, tech_stack: TechStackDocument) -> str:
         _ = tech_stack

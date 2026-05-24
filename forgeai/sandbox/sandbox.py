@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 import docker
-from docker.errors import DockerException
+from docker.errors import DockerException, ImageNotFound
 
 from forgeai.exceptions import SandboxProvisionError, SandboxTimeoutError
 from forgeai.sandbox.schemas import RunnerOutput
@@ -158,6 +158,107 @@ class Sandbox:
             raise SandboxTimeoutError("Sandbox execution timed out") from exc
         except (DockerException, OSError) as exc:
             logger.error("Sandbox provision failed: %s", exc)
+            if container is not None:
+                await self._destroy(container)
+            raise SandboxProvisionError(str(exc)) from exc
+        finally:
+            if container is not None:
+                await self._destroy(container)
+
+    def _ensure_vitest_image(self) -> str:
+        """Build forgeai-vitest-sandbox image if it does not exist."""
+        image_name = "forgeai-vitest-sandbox:1.0"
+        try:
+            self._client.images.get(image_name)
+            logger.info("Vitest sandbox image already exists: %s", image_name)
+            return image_name
+        except ImageNotFound:
+            logger.info("Building Vitest sandbox image %s...", image_name)
+            dockerfile = (
+                b"FROM node:18-alpine\n"
+                b"WORKDIR /app\n"
+                b"RUN npm install -g vitest@1.6.0\n"
+            )
+            self._client.images.build(
+                fileobj=io.BytesIO(dockerfile),
+                tag=image_name,
+                rm=True,
+            )
+            logger.info("Vitest sandbox image built: %s", image_name)
+            return image_name
+
+    async def run_vitest(self, code: str, test_code: str) -> RunnerOutput:
+        """Run Vitest tests in an isolated Node.js container."""
+        container = None
+        start = time.perf_counter()
+        timeout = self._timeout_for_complexity()
+
+        package_json = (
+            '{\n'
+            '  "type": "module",\n'
+            '  "scripts": { "test": "vitest run --reporter=verbose" }\n'
+            '}'
+        )
+
+        try:
+            image_name = await asyncio.to_thread(self._ensure_vitest_image)
+            name = f"forgeai-vitest-{uuid4()}"
+            nano_cpus = int(self.config.cpu_limit * 1_000_000_000)
+            logger.info("Provisioning Vitest sandbox container %s", name)
+            container = await asyncio.to_thread(
+                self._client.containers.create,
+                image_name,
+                name=name,
+                command=["sh", "-c", "sleep 3600"],
+                network_mode="none",
+                mem_limit=self.config.memory_limit,
+                nano_cpus=nano_cpus,
+                working_dir="/app",
+                auto_remove=False,
+                detach=True,
+            )
+            await asyncio.to_thread(container.start)
+
+            await self._write_file(container, "/app/module.js", code)
+            await self._write_file(container, "/app/module.test.js", test_code)
+            await self._write_file(container, "/app/package.json", package_json)
+
+            logger.info("Executing Vitest in sandbox container %s", name)
+            exec_result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    container.exec_run,
+                    ["sh", "-c", "vitest run --reporter=verbose"],
+                    workdir="/app",
+                    demux=True,
+                ),
+                timeout=timeout,
+            )
+            stdout_b, stderr_b = exec_result.output if exec_result.output else (b"", b"")
+            stdout = stdout_b.decode("utf-8", errors="replace") if stdout_b else ""
+            stderr = stderr_b.decode("utf-8", errors="replace") if stderr_b else ""
+            success = exec_result.exit_code == 0
+            elapsed = time.perf_counter() - start
+
+            passed = stdout.count(" ✓ ")
+            failed = stdout.count(" × ") + stdout.count(" FAIL ")
+
+            return RunnerOutput(
+                success=success,
+                total_tests=passed + failed,
+                passed_tests=passed,
+                failed_tests=failed,
+                test_cases=[],
+                stdout=stdout,
+                stderr=stderr,
+                execution_time_seconds=elapsed,
+                timed_out=False,
+                sandbox_error="" if success else "Vitest tests failed",
+            )
+        except asyncio.TimeoutError as exc:
+            if container is not None:
+                await self._destroy(container)
+            raise SandboxTimeoutError("Vitest sandbox timed out") from exc
+        except (DockerException, OSError) as exc:
             if container is not None:
                 await self._destroy(container)
             raise SandboxProvisionError(str(exc)) from exc

@@ -187,22 +187,64 @@ class QAAgent(BaseAgent):
                 )
         if self.test_runner is None:
             raise RuntimeError("QAAgent requires a TestRunner for review()")
+        res = await self.db.execute(select(Task).where(Task.id == task_id))
+        task = res.scalar_one_or_none()
         if (
             development_phase == "BACKEND_PHASE"
             and not test_code.strip()
             and self.llm is not None
+            and task is not None
         ):
-            res = await self.db.execute(select(Task).where(Task.id == task_id))
-            task = res.scalar_one_or_none()
+            tech_stack_for_tests = await load_tech_stack_document(self.db, task.project_id)
+            if tech_stack_for_tests:
+                test_code = await self.generate_backend_tests(
+                    code,
+                    task_description or "",
+                    tech_stack_for_tests,
+                )
+
+        tech_stack = None
+        try:
             if task is not None:
                 tech_stack = await load_tech_stack_document(self.db, task.project_id)
-                if tech_stack:
-                    test_code = await self.generate_backend_tests(
-                        code,
-                        task_description or "",
-                        tech_stack,
-                    )
-        return await self.test_runner.run(code=code, test_code=test_code)
+        except Exception:
+            pass
+
+        use_vitest = False
+        if tech_stack:
+            tf = tech_stack.testing_framework.lower()
+            use_vitest = "vitest" in tf or "jest" in tf
+
+        try:
+            if use_vitest:
+                return await self.test_runner.sandbox.run_vitest(code, test_code)
+            return await self.test_runner.run(code=code, test_code=test_code)
+        except SandboxTimeoutError as exc:
+            return RunnerOutput(
+                success=False,
+                total_tests=0,
+                passed_tests=0,
+                failed_tests=0,
+                test_cases=[],
+                stdout="",
+                stderr="",
+                execution_time_seconds=0.0,
+                timed_out=True,
+                sandbox_error=str(exc),
+            )
+        except SandboxProvisionError as exc:
+            return RunnerOutput(
+                success=False,
+                total_tests=0,
+                passed_tests=0,
+                failed_tests=0,
+                test_cases=[],
+                stdout="",
+                stderr="",
+                execution_time_seconds=0.0,
+                timed_out=False,
+                sandbox_error=str(exc),
+            )
 
     async def _run_playwright(self, code: str, test_code: str) -> RunnerOutput:
         if self.frontend_sandbox is None:

@@ -10,6 +10,8 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from sqlalchemy import select
+
 from forgeai.agents.base import BaseAgent
 from forgeai.contracts.registry import ComponentRegistry
 from forgeai.contracts.schemas import (
@@ -20,7 +22,9 @@ from forgeai.contracts.schemas import (
     RouteDefinition,
 )
 from forgeai.llm.client import LLMClient
+from forgeai.llm.schemas import MasterDocument
 from forgeai.memory.agent_memory import AgentMemory
+from forgeai.models.project_artefact import ProjectArtefactModel
 from forgeai.models.task import Task
 from forgeai.state_machine.machine import TaskStateMachine
 from forgeai.state_machine.states import TaskState
@@ -188,6 +192,43 @@ class FrontendAgent(BaseAgent):
             )
         return routes
 
+    async def _load_master_document(self, project_id: uuid.UUID) -> MasterDocument | None:
+        row = (
+            await self.db.execute(
+                select(ProjectArtefactModel).where(
+                    ProjectArtefactModel.project_id == project_id,
+                    ProjectArtefactModel.artefact_type == "master_document",
+                    ProjectArtefactModel.is_current.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+        if row is None:
+            return None
+        return MasterDocument.model_validate(row.content)
+
+    def _api_wiring_section(self, master_document: MasterDocument) -> str:
+        if not master_document.api_surfaces:
+            return ""
+        endpoint_lines = "\n".join(
+            f"  {s.method} {s.endpoint} — {s.description}"
+            for s in master_document.api_surfaces
+        )
+        return f"""
+IMPORTANT: This component connects to a backend REST API.
+Do NOT use local state for data that comes from the API.
+Use fetch() or axios for all data operations.
+API base URL: import.meta.env.VITE_API_URL ?? '/api'
+
+Available endpoints:
+{endpoint_lines}
+
+For every API call:
+- Show loading state while request is in flight
+- Show error message if request fails
+- Update UI immediately after successful mutation
+- No full page reloads — SPA behavior required
+"""
+
     async def complete_work(
         self,
         task_id: uuid.UUID,
@@ -197,13 +238,20 @@ class FrontendAgent(BaseAgent):
     ) -> Task:
         if self.llm is None or self.registry is None or self.memory is None:
             raise RuntimeError("FrontendAgent requires llm_client, component_registry, and agent_memory")
-        project_id = ""
+        result = await self.db.execute(select(Task).where(Task.id == task_id))
+        task = result.scalar_one()
+        project_id = str(task.project_id)
         existing: list[str] = []
         if self.nav_contract:
             project_id = self.nav_contract.project_id
         if project_id:
             all_entries = await self.registry.list_all(project_id)
             existing = [e.component_name for e in all_entries]
+
+        master_document = await self._load_master_document(task.project_id)
+        api_section = ""
+        if master_document is not None:
+            api_section = self._api_wiring_section(master_document)
 
         ranked = await self.memory.retrieve_lessons(
             self.agent_role,
@@ -216,6 +264,7 @@ class FrontendAgent(BaseAgent):
         nav_block = self.nav_contract.model_dump_json() if self.nav_contract else "{}"
         user_message = (
             f"Task:\n{task_description}\n\n"
+            f"{api_section}\n"
             f"PageSpec:\n{page_spec.model_dump_json()}\n\n"
             f"Navigation_Contract:\n{nav_block}\n\n"
             f"Existing registry components: {existing}\n\n"
