@@ -60,8 +60,26 @@ from forgeai.state_machine.transitions import KEY_METADATA, KEY_PHASE_APPROVAL, 
 logger = logging.getLogger(__name__)
 
 ROOT_LAYOUT_TASK_TITLE = "Build AppLayout — shared shell, NavBar, Footer"
-FRONTEND_SHELL_TASK_TITLE = "Create frontend app shell"
-BACKEND_SERVER_TASK_TITLE = "Create backend server entry point"
+BACKEND_SERVER_JS_TASK_TITLE = "Create src/server.js"
+BACKEND_DB_JS_TASK_TITLE = "Create src/db.js"
+PACKAGE_JSON_TASK_TITLE = "Create package.json"
+FRONTEND_INDEX_HTML_TASK_TITLE = "Create index.html"
+FRONTEND_MAIN_JSX_TASK_TITLE = "Create src/main.jsx"
+FRONTEND_APP_JSX_TASK_TITLE = "Create src/App.jsx with routing"
+FRONTEND_VITE_CONFIG_TASK_TITLE = "Create vite.config.js"
+FRONTEND_TAILWIND_CONFIG_TASK_TITLE = "Create tailwind.config.js"
+BACKEND_INFRA_TASK_TITLES = (
+    BACKEND_SERVER_JS_TASK_TITLE,
+    BACKEND_DB_JS_TASK_TITLE,
+)
+FRONTEND_INFRA_TASK_TITLES = (
+    FRONTEND_INDEX_HTML_TASK_TITLE,
+    FRONTEND_MAIN_JSX_TASK_TITLE,
+    FRONTEND_APP_JSX_TASK_TITLE,
+    PACKAGE_JSON_TASK_TITLE,
+    FRONTEND_VITE_CONFIG_TASK_TITLE,
+    FRONTEND_TAILWIND_CONFIG_TASK_TITLE,
+)
 HISTORY_PAGE_TASK_TITLE = "Create History page"
 API_CLIENT_TASK_TITLE = "Create API client module"
 DATABASE_MIGRATION_TASK_TITLE = "Create database migration"
@@ -123,7 +141,7 @@ def _tech_stack_document_from_master(master_doc: MasterDocument) -> TechStackDoc
     )
 
 
-def _backend_server_task_description(
+def _backend_server_js_task_description(
     master_doc: MasterDocument,
     tech_stack: TechStackDocument,
 ) -> str:
@@ -133,20 +151,97 @@ def _backend_server_task_description(
         f"  {s.method} {s.endpoint} — {s.description}"
         for s in master_doc.api_surfaces
     )
-    return f"""Create the complete backend server entry point.
+    return f"""Create ONLY the Express app entry point file: src/server.js
 
 Tech stack: {tech_stack.language}
 Framework: {tech_stack.framework}
 Database: {tech_stack.database}
 Libraries: {', '.join(tech_stack.libraries)}
 
-API endpoints to wire up:
+API endpoints to wire up (reference only — do not create route files here):
 {endpoint_lines}
+
+Output a single src/server.js file with Express app setup, middleware, and /api router mount.
+Do not generate db.js, package.json, or any other files.
 {skill_section}
 """
 
 
-def _frontend_shell_task_description(
+def _backend_db_js_task_description(tech_stack: TechStackDocument) -> str:
+    backend_skill = select_backend_skill(tech_stack)
+    skill_section = f"\n\nSKILL REFERENCE:\n{backend_skill}" if backend_skill else ""
+    return f"""Create ONLY the PostgreSQL connection pool file: src/db.js
+
+Tech stack: {tech_stack.language}
+Framework: {tech_stack.framework}
+Database: {tech_stack.database}
+
+Output a single src/db.js file exporting a pg Pool and query helper.
+Do not generate server.js, package.json, or any other files.
+{skill_section}
+"""
+
+
+def _package_json_task_description(tech_stack: TechStackDocument) -> str:
+    backend_skill = select_backend_skill(tech_stack)
+    frontend_skill = select_frontend_skill(tech_stack)
+    skill_parts = []
+    if backend_skill:
+        skill_parts.append(f"BACKEND SKILL REFERENCE:\n{backend_skill}")
+    if frontend_skill:
+        skill_parts.append(f"FRONTEND SKILL REFERENCE:\n{frontend_skill}")
+    skill_section = (
+        f"\n\n{chr(10).join(skill_parts)}" if skill_parts else ""
+    )
+    return f"""Create ONLY a unified package.json at the project root.
+
+Tech stack: {tech_stack.language}
+Framework: {tech_stack.framework}
+Database: {tech_stack.database}
+Libraries: {', '.join(tech_stack.libraries)}
+
+Include BOTH frontend and backend dependencies in one file:
+- Frontend: React, Vite, Tailwind, react-router-dom, dev/build scripts
+- Backend: Express, pg, cors, helmet, dotenv, vitest, nodemon scripts
+
+Output a single package.json with type module, dependencies, devDependencies,
+and scripts for dev, start, build, and test.
+Do not generate source or config files.
+{skill_section}
+"""
+
+
+def _frontend_index_html_task_description(tech_stack: TechStackDocument) -> str:
+    frontend_skill = select_frontend_skill(tech_stack)
+    skill_section = f"\n\nSKILL REFERENCE:\n{frontend_skill}" if frontend_skill else ""
+    return f"""Create ONLY the Vite entry HTML file: index.html (project root).
+
+Tech stack: {tech_stack.language}
+Framework: {tech_stack.framework}
+Libraries: {', '.join(tech_stack.libraries)}
+
+Output a single index.html with root div and script tag pointing to /src/main.jsx.
+Do not generate JSX, config, or any other files.
+{skill_section}
+"""
+
+
+def _frontend_main_jsx_task_description(tech_stack: TechStackDocument) -> str:
+    frontend_skill = select_frontend_skill(tech_stack)
+    skill_section = f"\n\nSKILL REFERENCE:\n{frontend_skill}" if frontend_skill else ""
+    return f"""Create ONLY the React root mount file: src/main.jsx
+
+Tech stack: {tech_stack.language}
+Framework: {tech_stack.framework}
+Libraries: {', '.join(tech_stack.libraries)}
+
+Output a single src/main.jsx that mounts App into #root.
+Do not generate App.jsx, index.html, or any other files.
+{skill_section}
+"""
+
+
+def _frontend_app_jsx_task_description(
     nav: NavigationContract,
     tech_stack: TechStackDocument,
 ) -> str:
@@ -155,7 +250,7 @@ def _frontend_shell_task_description(
     route_lines = "\n".join(
         f"  {r.path} → {r.component_name}" for r in nav.routes
     )
-    return f"""Create the complete frontend application entry point.
+    return f"""Create ONLY src/App.jsx with BrowserRouter and route definitions.
 
 Tech stack: {tech_stack.language}
 Framework: {tech_stack.framework}
@@ -163,6 +258,39 @@ Libraries: {', '.join(tech_stack.libraries)}
 
 Routes to wire:
 {route_lines}
+
+Output a single src/App.jsx with Router, Routes, and Route entries for the paths above.
+Do not generate main.jsx, page components, or any other files.
+{skill_section}
+"""
+
+
+def _frontend_vite_config_task_description(tech_stack: TechStackDocument) -> str:
+    frontend_skill = select_frontend_skill(tech_stack)
+    skill_section = f"\n\nSKILL REFERENCE:\n{frontend_skill}" if frontend_skill else ""
+    return f"""Create ONLY vite.config.js for the React + Vite project.
+
+Tech stack: {tech_stack.language}
+Framework: {tech_stack.framework}
+Libraries: {', '.join(tech_stack.libraries)}
+
+Output a single vite.config.js with @vitejs/plugin-react.
+Do not generate any other files.
+{skill_section}
+"""
+
+
+def _frontend_tailwind_config_task_description(tech_stack: TechStackDocument) -> str:
+    frontend_skill = select_frontend_skill(tech_stack)
+    skill_section = f"\n\nSKILL REFERENCE:\n{frontend_skill}" if frontend_skill else ""
+    return f"""Create ONLY tailwind.config.js for the React + Vite project.
+
+Tech stack: {tech_stack.language}
+Framework: {tech_stack.framework}
+Libraries: {', '.join(tech_stack.libraries)}
+
+Output a single tailwind.config.js with content paths for index.html and src/**/*.
+Do not generate postcss.config.js or any other files.
 {skill_section}
 """
 
@@ -180,22 +308,33 @@ def _backend_tasks_from_master_doc(
     master_doc: MasterDocument,
     tech_stack: TechStackDocument | None = None,
 ) -> list[TaskSpec]:
-    """Backend server entry point first, then one task per API surface."""
+    """Backend infrastructure files first, then one task per API surface."""
     if not master_doc.api_surfaces:
         return []
 
     tasks: list[TaskSpec] = []
     if tech_stack is not None:
-        tasks.append(
-            TaskSpec(
-                title=BACKEND_SERVER_TASK_TITLE,
-                description=_backend_server_task_description(master_doc, tech_stack).strip(),
-                complexity="HIGH",
-                phase="BACKEND_PHASE",
-                dependencies=[],
-            )
+        tasks.extend(
+            [
+                TaskSpec(
+                    title=BACKEND_SERVER_JS_TASK_TITLE,
+                    description=_backend_server_js_task_description(
+                        master_doc, tech_stack
+                    ).strip(),
+                    complexity="MEDIUM",
+                    phase="BACKEND_PHASE",
+                    dependencies=[],
+                ),
+                TaskSpec(
+                    title=BACKEND_DB_JS_TASK_TITLE,
+                    description=_backend_db_js_task_description(tech_stack).strip(),
+                    complexity="MEDIUM",
+                    phase="BACKEND_PHASE",
+                    dependencies=[],
+                ),
+            ]
         )
-    endpoint_deps = [BACKEND_SERVER_TASK_TITLE] if tech_stack is not None else []
+    endpoint_deps = list(BACKEND_INFRA_TASK_TITLES) if tech_stack is not None else []
     for surface in master_doc.api_surfaces:
         title = f"Implement {surface.method} {surface.endpoint}"
         desc = (surface.description or "").strip() or title
@@ -229,21 +368,68 @@ def _frontend_tasks_from_navigation(
     nav: NavigationContract,
     tech_stack: TechStackDocument | None = None,
 ) -> list[TaskSpec]:
-    """Frontend tasks: app shell first, then layout, then page components."""
+    """Frontend tasks: infrastructure files first, then layout, then page components."""
     tasks: list[TaskSpec] = []
     shell_deps: list[str] = []
 
     if tech_stack is not None:
-        tasks.append(
-            TaskSpec(
-                title=FRONTEND_SHELL_TASK_TITLE,
-                description=_frontend_shell_task_description(nav, tech_stack).strip(),
-                complexity="HIGH",
-                phase="FRONTEND_PHASE",
-                dependencies=[],
-            )
+        tasks.extend(
+            [
+                TaskSpec(
+                    title=FRONTEND_INDEX_HTML_TASK_TITLE,
+                    description=_frontend_index_html_task_description(
+                        tech_stack
+                    ).strip(),
+                    complexity="MEDIUM",
+                    phase="FRONTEND_PHASE",
+                    dependencies=[],
+                ),
+                TaskSpec(
+                    title=FRONTEND_MAIN_JSX_TASK_TITLE,
+                    description=_frontend_main_jsx_task_description(
+                        tech_stack
+                    ).strip(),
+                    complexity="MEDIUM",
+                    phase="FRONTEND_PHASE",
+                    dependencies=[],
+                ),
+                TaskSpec(
+                    title=FRONTEND_APP_JSX_TASK_TITLE,
+                    description=_frontend_app_jsx_task_description(
+                        nav, tech_stack
+                    ).strip(),
+                    complexity="MEDIUM",
+                    phase="FRONTEND_PHASE",
+                    dependencies=[],
+                ),
+                TaskSpec(
+                    title=PACKAGE_JSON_TASK_TITLE,
+                    description=_package_json_task_description(tech_stack).strip(),
+                    complexity="MEDIUM",
+                    phase="FRONTEND_PHASE",
+                    dependencies=[],
+                ),
+                TaskSpec(
+                    title=FRONTEND_VITE_CONFIG_TASK_TITLE,
+                    description=_frontend_vite_config_task_description(
+                        tech_stack
+                    ).strip(),
+                    complexity="MEDIUM",
+                    phase="FRONTEND_PHASE",
+                    dependencies=[],
+                ),
+                TaskSpec(
+                    title=FRONTEND_TAILWIND_CONFIG_TASK_TITLE,
+                    description=_frontend_tailwind_config_task_description(
+                        tech_stack
+                    ).strip(),
+                    complexity="MEDIUM",
+                    phase="FRONTEND_PHASE",
+                    dependencies=[],
+                ),
+            ]
         )
-        shell_deps = [FRONTEND_SHELL_TASK_TITLE]
+        shell_deps = list(FRONTEND_INFRA_TASK_TITLES)
 
     tasks.append(
         TaskSpec(
@@ -481,8 +667,8 @@ def _missing_tasks_from_documents(
         titles, "migration"
     ):
         backend_deps = (
-            [BACKEND_SERVER_TASK_TITLE]
-            if BACKEND_SERVER_TASK_TITLE in titles
+            list(BACKEND_INFRA_TASK_TITLES)
+            if any(t in titles for t in BACKEND_INFRA_TASK_TITLES)
             else []
         )
         tasks.append(
@@ -1084,7 +1270,10 @@ class LeadAgent(BaseAgent):
             if exists is not None:
                 continue
             agent = assigned_agent
-            if spec.title != FRONTEND_SHELL_TASK_TITLE and spec.title != ROOT_LAYOUT_TASK_TITLE:
+            if (
+                spec.title not in FRONTEND_INFRA_TASK_TITLES
+                and spec.title != ROOT_LAYOUT_TASK_TITLE
+            ):
                 if "Dashboard" in spec.title or "Settings" in spec.title:
                     agent = "frontend_agent_2"
             task = await self.create_task(
@@ -1345,7 +1534,6 @@ class LeadAgent(BaseAgent):
 
         fe_by_id = {a.agent_id: a for a in frontend_agents}
         root_title = ROOT_LAYOUT_TASK_TITLE
-        shell_title = FRONTEND_SHELL_TASK_TITLE
         await self.create_frontend_tasks_from_navigation(
             project_id, navigation_contract
         )
@@ -1353,21 +1541,23 @@ class LeadAgent(BaseAgent):
             select(Task).where(Task.project_id == project_id)
         )
         all_tasks = list(res.scalars())
+        infra_titles = set(FRONTEND_INFRA_TASK_TITLES)
         frontend_tasks = [
             t
             for t in all_tasks
-            if t.title == shell_title
+            if t.title in infra_titles
             or t.title == root_title
             or "page" in t.title.lower()
             or "component" in t.title.lower()
             or "AppLayout" in t.title
-            or "frontend app shell" in t.title.lower()
             or "api client" in t.title.lower()
         ]
-        shell_tasks = [t for t in frontend_tasks if t.title == shell_title]
+        shell_tasks = [t for t in frontend_tasks if t.title in infra_titles]
         root_tasks = [t for t in frontend_tasks if t.title == root_title]
         other_tasks = [
-            t for t in frontend_tasks if t.title not in (shell_title, root_title)
+            t
+            for t in frontend_tasks
+            if t.title not in infra_titles and t.title != root_title
         ]
 
         completed: list[str] = []
@@ -1445,7 +1635,7 @@ class LeadAgent(BaseAgent):
         for shell in shell_tasks:
             page = next((p for p in layout_spec.pages if p.route == "/"), layout_spec.pages[0])
             await _run_task_cycle(shell, page)
-            await self.unlock_dependent_tasks(shell_title, project_id)
+            await self.unlock_dependent_tasks(shell.title, project_id)
 
         for root in root_tasks:
             page = next((p for p in layout_spec.pages if p.route == "/"), layout_spec.pages[0])

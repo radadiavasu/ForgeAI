@@ -160,6 +160,8 @@ class PackageAssembler:
 
         has_frontend = False
         has_backend = False
+        lang_lower = tech_stack.language.lower()
+        is_js_ts = "javascript" in lang_lower or "typescript" in lang_lower
 
         for task in done_tasks:
             await self.db.refresh(task)
@@ -204,6 +206,18 @@ class PackageAssembler:
                 print(
                     f"[DELIVERY] SKIP {rel_path} — detected ForgeAI pipeline source, "
                     "not generated project code"
+                )
+                continue
+
+            if is_js_ts and rel_path.endswith(".py"):
+                logger.warning(
+                    "Skipping .py file %s for JS/TS project (task %s: %r)",
+                    rel_path,
+                    task.id,
+                    task.title,
+                )
+                print(
+                    f"[DELIVERY] SKIP {rel_path} — JS/TS project, not writing Python files"
                 )
                 continue
 
@@ -286,6 +300,20 @@ class PackageAssembler:
         print("[GIT] Committing task files...")
         print(f"[GIT] {len(files_written)} files committed")
 
+        if is_js_ts:
+            for cleanup_name in ("requirements.txt", "main.py"):
+                cleanup_path = root / cleanup_name
+                if cleanup_path.is_file():
+                    removed_bytes = cleanup_path.stat().st_size
+                    cleanup_path.unlink()
+                    logger.warning(
+                        "Removed %s from JS/TS output package", cleanup_name
+                    )
+                    print(f"[DELIVERY] Removed {cleanup_name} from JS/TS output")
+                    if cleanup_name in files_written:
+                        files_written.remove(cleanup_name)
+                        total_bytes -= removed_bytes
+
         release_tag = "release-v1"
         rollback = self.git.create_tag(release_tag, "ForgeAI delivery release v1")
         print(f"[GIT] Tag created: {release_tag}")
@@ -319,23 +347,41 @@ class PackageAssembler:
         return ".py"
 
     def _derive_file_path(self, task: Task, tech_stack: TechStackDocument) -> str:
-        # Infrastructure task detection by title
         title_lower = (task.title or "").lower()
         lang = tech_stack.language.lower() if tech_stack else ""
         is_js = "javascript" in lang or "typescript" in lang
 
+        # Exact single-file infrastructure routing
+        if "src/server.js" in title_lower or title_lower == "create src/server.js":
+            return "src/server.js"
+        if "src/db.js" in title_lower:
+            return "src/db.js"
+        if "src/main.jsx" in title_lower:
+            return "src/main.jsx"
+        if "src/app.jsx" in title_lower:
+            return "src/App.jsx"
+        if "index.html" in title_lower:
+            return "index.html"
+        if "vite.config" in title_lower:
+            return "vite.config.js"
+        if "tailwind.config" in title_lower:
+            return "tailwind.config.js"
+        if title_lower == "create package.json" or "create package.json" in title_lower:
+            return "package.json"
+        if "package.json for backend" in title_lower:
+            return "package.json"
+        if "package.json for frontend" in title_lower:
+            return "package.json"
+        if "dockerfile.backend" in title_lower or "backend dockerfile" in title_lower:
+            return "Dockerfile.backend"
+        if "dockerfile.frontend" in title_lower or "frontend dockerfile" in title_lower:
+            return "Dockerfile.frontend"
         if "docker compose" in title_lower:
             return "docker-compose.yml"
+        if "database migration" in title_lower or "001_init" in title_lower:
+            return "migrations/001_init.sql"
 
-        if "frontend dockerfile" in title_lower:
-            return "Dockerfile.frontend"
-
-        if "backend dockerfile" in title_lower:
-            return "Dockerfile.backend"
-
-        if "database migration" in title_lower or "db migration" in title_lower:
-            if is_js:
-                return "migrations/001_init.sql"
+        if "db migration" in title_lower:
             return "migrations/001_init.sql"
 
         if "server entry point" in title_lower:

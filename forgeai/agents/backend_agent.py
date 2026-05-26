@@ -197,8 +197,15 @@ class BackendAgent(BaseAgent):
         lesson_lines = [f"- {x.lesson.rule}" for x in ranked[:5]]
         lessons_block = "\n".join(lesson_lines) if lesson_lines else "(no prior lessons)"
         tech_stack = await load_tech_stack_document(self.db, task.project_id)
+        task_title_lower = (task.title or "").lower()
+        is_dockerfile_task = "dockerfile" in task_title_lower
         system_prompt = f"{BACKEND_ROLE_PROMPT}\n\nRelevant past lessons:\n{lessons_block}"
-        if tech_stack:
+        if is_dockerfile_task:
+            system_prompt += (
+                "\n\nOutput ONLY the Dockerfile content. No JavaScript code. "
+                "No JSON. No markdown. Raw Dockerfile syntax only. Start with FROM."
+            )
+        elif tech_stack:
             system_prompt += (
                 f'\n\nFor this project, "test_code" must be a '
                 f"{_test_code_field_description(tech_stack)}."
@@ -223,6 +230,11 @@ class BackendAgent(BaseAgent):
             f"Master document context:\n{master_document_section}\n"
             f"{contract_block}"
         )
+        if is_dockerfile_task:
+            user_message += (
+                "\n\nOutput ONLY the Dockerfile content. No JavaScript code. "
+                "No JSON. No markdown. Raw Dockerfile syntax only. Start with FROM."
+            )
 
         logger.info(
             "[BACKEND] Generating implementation via LLM (complexity=%s loop=%s)...",
