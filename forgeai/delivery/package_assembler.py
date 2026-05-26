@@ -319,6 +319,44 @@ class PackageAssembler:
         return ".py"
 
     def _derive_file_path(self, task: Task, tech_stack: TechStackDocument) -> str:
+        # Infrastructure task detection by title
+        title_lower = (task.title or "").lower()
+        lang = tech_stack.language.lower() if tech_stack else ""
+        is_js = "javascript" in lang or "typescript" in lang
+
+        if "docker compose" in title_lower:
+            return "docker-compose.yml"
+
+        if "frontend dockerfile" in title_lower:
+            return "Dockerfile.frontend"
+
+        if "backend dockerfile" in title_lower:
+            return "Dockerfile.backend"
+
+        if "database migration" in title_lower or "db migration" in title_lower:
+            if is_js:
+                return "migrations/001_init.sql"
+            return "migrations/001_init.sql"
+
+        if "server entry point" in title_lower:
+            if is_js:
+                return "src/server.js"
+            if "python" in lang or "fastapi" in lang or "django" in lang:
+                return "src/main.py"
+
+        if "app shell" in title_lower or "frontend app shell" in title_lower:
+            return "src/main.jsx"
+
+        if "api client" in title_lower:
+            if is_js:
+                return "src/api/client.js"
+            return "src/api/client.py"
+
+        if "env" in title_lower and (
+            "environment" in title_lower or ".env" in title_lower
+        ):
+            return ".env.example"
+
         if self._is_frontend_task(task):
             return self._derive_frontend_file_path(task.title)
         title = task.title
