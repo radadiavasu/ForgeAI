@@ -36,6 +36,14 @@ Output JSON with fields:
 - "code": complete implementation source for the primary module (e.g. main.py or index.js)
 - "test_code": tests using the project's testing framework
 
+The "code" field must be immediately executable when run
+directly as a standalone script.
+For JavaScript/Node.js: the script must start the server
+or call the main function when executed directly.
+Do NOT write functions that only define without calling.
+Do NOT write placeholder comments instead of code.
+Output ONLY executable code. No markdown. No explanation.
+
 If you cannot emit JSON, output only the implementation source.
 """.strip()
 
@@ -223,6 +231,26 @@ class BackendAgent(BaseAgent):
         if tech_stack:
             tech_block = format_mandatory_tech_stack_block(tech_stack) + "\n\n"
             critical_block = format_critical_language_block(tech_stack) + "\n\n"
+        if loop_count > 0 and self.task_memory is not None:
+            try:
+                defect_json = await self.task_memory.get(
+                    str(task_id), "defect_report"
+                )
+                if defect_json:
+                    import json as _json
+
+                    defect = _json.loads(defect_json)
+                    defect_block = (
+                        "PREVIOUS ATTEMPT FAILED. Fix these specific issues:\n"
+                        f"Summary: {defect.get('failure_summary', '')}\n\n"
+                        f"Required fixes:\n{defect.get('suggestions', '')}\n\n"
+                        "Failed tests:\n"
+                        + "\n".join(defect.get("failed_tests", []))
+                        + "\n\nOriginal task:\n"
+                    )
+                    task_description = defect_block + (task_description or "")
+            except Exception:
+                pass
         user_message = (
             f"{tech_block}"
             f"{critical_block}"

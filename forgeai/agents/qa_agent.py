@@ -157,11 +157,14 @@ class QAAgent(BaseAgent):
         *,
         api_contract: dict | None = None,
         task_description: str | None = None,
+        component_registry: dict[str, str] | None = None,
     ) -> RunnerOutput:
         """Run sandbox tests after enforcing no self-approval."""
         await self._assert_not_self_approval(task_id)
         if development_phase == "FRONTEND_PHASE":
-            return await self._run_playwright(code, test_code)
+            return await self._run_playwright(
+                code, test_code, component_registry=component_registry
+            )
         if (
             development_phase == "BACKEND_PHASE"
             and api_contract
@@ -246,11 +249,21 @@ class QAAgent(BaseAgent):
                 sandbox_error=str(exc),
             )
 
-    async def _run_playwright(self, code: str, test_code: str) -> RunnerOutput:
+    async def _run_playwright(
+        self,
+        code: str,
+        test_code: str,
+        *,
+        component_registry: dict[str, str] | None = None,
+    ) -> RunnerOutput:
         if self.frontend_sandbox is None:
             raise RuntimeError("QAAgent requires FrontendSandbox for FRONTEND_PHASE review()")
         try:
-            return await self.frontend_sandbox.run(component_code=code, test_code=test_code)
+            return await self.frontend_sandbox.run(
+                component_code=code,
+                test_code=test_code,
+                component_registry=component_registry,
+            )
         except SandboxTimeoutError as exc:
             return RunnerOutput(
                 success=False,

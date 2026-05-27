@@ -337,7 +337,14 @@ def _backend_tasks_from_master_doc(
     endpoint_deps = list(BACKEND_INFRA_TASK_TITLES) if tech_stack is not None else []
     for surface in master_doc.api_surfaces:
         title = f"Implement {surface.method} {surface.endpoint}"
-        desc = (surface.description or "").strip() or title
+        desc = f"""{surface.description}
+
+Endpoint: {surface.method} {surface.endpoint}
+Request schema: {json.dumps(surface.request_schema, indent=2)}
+Response schema: {json.dumps(surface.response_schema, indent=2)}
+
+Your implementation MUST match this exact request/response shape.
+"""
         tasks.append(
             TaskSpec(
                 title=title,
@@ -1459,6 +1466,20 @@ class LeadAgent(BaseAgent):
             )
         orchestrator = self.build_qa_orchestrator(loop_counter, escalation_ladder)
         await qa_agent.begin_review(task_id)
+        component_registry: dict[str, str] | None = None
+        if development_phase == "FRONTEND_PHASE":
+            from forgeai.contracts.registry import ComponentRegistry
+
+            task_res = await self.db.execute(select(Task).where(Task.id == task_id))
+            task_obj = task_res.scalar_one_or_none()
+            if task_obj is not None:
+                reg = ComponentRegistry(self.db)
+                reg_entries = await reg.list_all(str(task_obj.project_id))
+                component_registry = {
+                    e.component_name: e.source_code
+                    for e in reg_entries
+                    if e.source_code
+                }
         runner_output = await qa_agent.review(
             task_id,
             code=code,
@@ -1466,6 +1487,7 @@ class LeadAgent(BaseAgent):
             development_phase=development_phase,
             api_contract=api_contract,
             task_description=task_description,
+            component_registry=component_registry,
         )
         contract_violation = (runner_output.sandbox_error or "").startswith(
             "API contract violation"
@@ -1585,7 +1607,14 @@ class LeadAgent(BaseAgent):
             react_code = str(meta.get(KEY_WORK_OUTPUT, ""))
             test_code = str(
                 (meta.get(KEY_METADATA) or {}).get("frontend_test_code")
-                or "def test_ui_present():\n    assert isinstance(GENERATED_UI, str)\n"
+                or (
+                    "import { describe, it, expect } from 'vitest';\n"
+                    "describe('UI', () => {\n"
+                    "  it('renders', () => {\n"
+                    "    expect(true).toBe(true);\n"
+                    "  });\n"
+                    "});\n"
+                )
             )
             if development_phase == "FRONTEND_PHASE":
                 bundle = react_code

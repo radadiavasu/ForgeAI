@@ -55,6 +55,7 @@ class ComponentEntry(BaseModel):
     interface_definition: str
     file_path: str
     project_id: str
+    source_code: str | None = None
     registered_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     used_by: list[str] = Field(default_factory=list)
 

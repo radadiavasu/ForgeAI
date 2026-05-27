@@ -44,6 +44,7 @@ class FrontendSandbox:
         component_code: str,
         test_code: str,
         entry_point: str = "App",
+        component_registry: dict[str, str] | None = None,
     ) -> RunnerOutput:
         """Run Playwright tests against ``component_code`` mounted as the Vite app."""
         _ = entry_point  # reserved for future multi-entry wiring
@@ -71,6 +72,13 @@ class FrontendSandbox:
             await asyncio.to_thread(container.start)
 
             await self._write_file(container, "/sandbox/src/App.jsx", component_code)
+            if component_registry:
+                for name, code in component_registry.items():
+                    await self._write_file(
+                        container,
+                        f"/sandbox/src/{name}.jsx",
+                        code,
+                    )
             logger.info("[FRONTEND SANDBOX] Writing React component...")
             await self._write_entry_files(container)
             await self._write_file(container, "/sandbox/tests/app.spec.js", test_code)

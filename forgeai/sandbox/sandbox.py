@@ -138,17 +138,22 @@ class Sandbox:
             stdout = stdout_b.decode("utf-8", errors="replace") if stdout_b else ""
             stderr = stderr_b.decode("utf-8", errors="replace") if stderr_b else ""
             elapsed = time.perf_counter() - start
+            exit_code = exec_result.exit_code
+            success = (exit_code == 0)
+            passed = stdout.count(" PASSED")
+            failed = stdout.count(" FAILED") + stdout.count(" ERROR")
+
             return RunnerOutput(
-                success=False,
-                total_tests=0,
-                passed_tests=0,
-                failed_tests=0,
+                success=success,
+                total_tests=passed + failed,
+                passed_tests=passed,
+                failed_tests=failed,
                 test_cases=[],
                 stdout=stdout,
                 stderr=stderr,
                 execution_time_seconds=elapsed,
                 timed_out=False,
-                sandbox_error="",
+                sandbox_error="" if success else "Tests failed",
             )
         except asyncio.TimeoutError as exc:
             elapsed = time.perf_counter() - start

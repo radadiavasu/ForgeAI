@@ -234,6 +234,14 @@ class PackageAssembler:
                 [rel_path],
             )
 
+        compose = await self._generate_docker_compose(tech_stack, str(root))
+        compose_path = root / "docker-compose.yml"
+        compose_path.write_text(compose, encoding="utf-8")
+        print("[DELIVERY] Generating docker-compose.yml...")
+        files_written.append("docker-compose.yml")
+        total_bytes += compose_path.stat().st_size
+        self.git.commit("compose", "forgeai", "deployment", ["docker-compose.yml"])
+
         self._write_requirements_txt(root, tech_stack, has_backend)
 
         dockerfile = await self._generate_dockerfile(
@@ -246,14 +254,6 @@ class PackageAssembler:
         files_written.append("Dockerfile")
         total_bytes += df_path.stat().st_size
         self.git.commit("dockerfile", "forgeai", "deployment", ["Dockerfile"])
-
-        compose = await self._generate_docker_compose(tech_stack, str(root))
-        compose_path = root / "docker-compose.yml"
-        compose_path.write_text(compose, encoding="utf-8")
-        print("[DELIVERY] Generating docker-compose.yml...")
-        files_written.append("docker-compose.yml")
-        total_bytes += compose_path.stat().st_size
-        self.git.commit("compose", "forgeai", "deployment", ["docker-compose.yml"])
 
         env_content = self._generate_env_example(tech_stack)
         env_path = root / ".env.example"

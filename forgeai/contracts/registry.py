@@ -35,6 +35,7 @@ class ComponentRegistry:
         owner_agent_id: str,
         interface_definition: str,
         file_path: str,
+        source_code: str | None = None,
     ) -> ComponentEntry:
         existing = await self.query(project_id, component_name)
         if existing is not None:
@@ -49,6 +50,7 @@ class ComponentRegistry:
             interface_definition=interface_definition,
             file_path=file_path,
             project_id=str(pid),
+            source_code=source_code,
             registered_at=now,
             used_by=[],
         )
