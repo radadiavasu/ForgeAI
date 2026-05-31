@@ -17,7 +17,7 @@ from sqlalchemy import select
 from forgeai.escalation.ladder import EscalationLadder
 from forgeai.escalation.loop_counter import LoopCounter
 from forgeai.escalation.persistence import EscalationPersistence
-from forgeai.llm.client import LLMClient
+from forgeai.llm.schemas import TechStackDocument
 from forgeai.models.task import Task
 from forgeai.orchestration.qa_loop import QA_FAILURE_SIGNATURE, QAOrchestrator
 from forgeai.orchestration.schemas import BackendPhaseResult, ContractValidationResult, QADecision
@@ -30,11 +30,12 @@ if TYPE_CHECKING:
     from forgeai.agents.backend_agent import BackendAgent
     from forgeai.agents.lead_agent import LeadAgent
     from forgeai.agents.qa_agent import QAAgent
+    from forgeai.llm.client import LLMClient
 
 logger = logging.getLogger(__name__)
 
 CONTRACT_VALIDATION_PROMPT = """
-You are QA_Agent validating Python backend code against an API contract.
+You are QA_Agent validating backend code against an API contract.
 
 Compare generated_code to api_contract for the described task.
 Check:
@@ -177,29 +178,36 @@ class BackendOrchestrator:
             )
         self.escalation_ladder = escalation_ladder
 
-    async def _prepull_sandbox_image(self) -> None:
-        """Cache python:3.11-slim before backend tasks run."""
+    async def _prepull_sandbox_image(
+        self,
+        tech_stack: TechStackDocument | None = None,
+    ) -> None:
+        """Cache sandbox image before backend tasks run."""
+        lang = (tech_stack.language.lower() if tech_stack else "python")
+        is_js = "javascript" in lang or "typescript" in lang
+
+        if is_js:
+            image = "forgeai-vitest-sandbox:1.0"
+        else:
+            image = "python:3.11-slim"
 
         def _pull() -> subprocess.CompletedProcess[str]:
             return subprocess.run(
-                ["docker", "pull", "python:3.11-slim"],
+                ["docker", "pull", image],
                 capture_output=True,
                 text=True,
             )
 
-        logger.info("Pre-pulling sandbox image python:3.11-slim")
+        logger.info("Pre-pulling sandbox image %s", image)
         try:
             proc = await asyncio.to_thread(_pull)
             if proc.returncode != 0:
                 logger.warning(
-                    "Sandbox image pre-pull failed (image may already exist): %s",
+                    "Sandbox image pre-pull failed: %s",
                     (proc.stderr or proc.stdout or "").strip(),
                 )
         except Exception as exc:
-            logger.warning(
-                "Sandbox image pre-pull failed (image may already exist): %s",
-                exc,
-            )
+            logger.warning("Sandbox image pre-pull failed: %s", exc)
 
     async def run_backend_phase(
         self,
@@ -208,9 +216,16 @@ class BackendOrchestrator:
         *,
         master_document_section: str = "",
     ) -> BackendPhaseResult:
-        await self._prepull_sandbox_image()
         started = time.monotonic()
         pid = uuid.UUID(project_id)
+        from forgeai.agents.backend_agent import load_tech_stack_document
+
+        tech_stack = None
+        try:
+            tech_stack = await load_tech_stack_document(self.db, pid)
+        except Exception:
+            pass
+        await self._prepull_sandbox_image(tech_stack)
         res = await self.db.execute(
             select(Task).where(
                 Task.project_id == pid,

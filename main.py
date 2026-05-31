@@ -1368,8 +1368,15 @@ async def async_main() -> None:
                 tm,
             )
             await _run14_live_mode(session, project_id, result.master_document)
-            await _run15_patch_mode(session, llm, memory, project_id, result.master_document)
-            await _run16_change_mode(session, llm, memory, project_id, result.master_document)
+            # === RUN 15: PATCH MODE (BUGFIX) — deferred to Phase 12 ===
+            # Hardcoded test scenario — not needed until LIVE mode is
+            # production-ready. Re-enable when testing PatchExecutor.
+            # await _run15_patch_mode(session, llm, memory, project_id, result.master_document)
+
+            # === RUN 16: CHANGE MODE (LARGE FEATURE) — deferred to Phase 12 ===
+            # Hardcoded test scenario — not needed until LIVE mode is
+            # production-ready. Re-enable when testing change classifier.
+            # await _run16_change_mode(session, llm, memory, project_id, result.master_document)
             # Legacy Phase 6 runs (optional — uncomment to execute 4–6 as well)
             # root_react_code = await _run4_root_layout(session, llm, memory, nav, layout, project_id, tm)
             # await _run5_dashboard(session, llm, memory, nav, layout, project_id, tm)
