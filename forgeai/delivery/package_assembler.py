@@ -329,6 +329,12 @@ class PackageAssembler:
         print("[DELIVERY] Validating Docker build...")
         docker_ok = await self._validate_docker_build(str(root), project_id)
 
+        from forgeai.delivery.consolidator import ProjectConsolidator
+
+        consolidator = ProjectConsolidator()
+        consolidator.consolidate(str(root), tech_stack)
+        print("[DELIVERY] Project consolidated — routes wired")
+
         return DeploymentPackage(
             project_id=project_id,
             output_dir=str(root.resolve()),
