@@ -337,14 +337,14 @@ def _backend_tasks_from_master_doc(
     endpoint_deps = list(BACKEND_INFRA_TASK_TITLES) if tech_stack is not None else []
     for surface in master_doc.api_surfaces:
         title = f"Implement {surface.method} {surface.endpoint}"
-        desc = f"""{surface.description}
-
-Endpoint: {surface.method} {surface.endpoint}
-Request schema: {json.dumps(surface.request_schema, indent=2)}
-Response schema: {json.dumps(surface.response_schema, indent=2)}
-
-Your implementation MUST match this exact request/response shape.
-"""
+        desc = (
+            f"{(surface.description or title).strip()}\n\n"
+            f"Endpoint: {surface.method} {surface.endpoint}\n"
+            f"Request schema: "
+            f"{json.dumps(surface.request_schema) if surface.request_schema else 'none'}\n"
+            f"Response schema: "
+            f"{json.dumps(surface.response_schema) if surface.response_schema else 'none'}\n"
+        )
         tasks.append(
             TaskSpec(
                 title=title,
@@ -1626,6 +1626,8 @@ class LeadAgent(BaseAgent):
                 bundle = f"GENERATED_UI = {json.dumps(react_code)}\n"
                 test_payload = test_code
 
+            task_retry_count = 0
+
             while True:
                 qa_cycles += 1
                 decision = await self.orchestrate_qa(
@@ -1648,11 +1650,12 @@ class LeadAgent(BaseAgent):
                     await self.handle_qa_rejection(
                         task.id, decision.defect_report, agent
                     )
+                task_retry_count += 1
                 await agent.complete_work(
                     task.id,
                     (decision.defect_report.suggestions if decision.defect_report else task.title),
                     page_spec,
-                    loop_count=qa_cycles,
+                    loop_count=task_retry_count,
                 )
                 hrows = await hist.get_history(task.id)
                 meta = hrows[-1].metadata_ or {}

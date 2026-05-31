@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import sys
 import uuid
@@ -1317,26 +1318,23 @@ async def async_main() -> None:
                 session, llm, memory, project_id, tm, api_contract
             )
             print("\n[PHASE] Integration QA — testing FE + BE together")
+            from forgeai.contracts.registry import ComponentRegistry
             fe_code_snippets = []
             try:
-                from sqlalchemy import select
-                from forgeai.models.task import Task
-                from forgeai.state_machine.states import TaskState
                 async with AsyncSessionFactory() as _s:
-                    _rows = await _s.execute(
-                        select(Task).where(
-                            Task.project_id == project_id,
-                            Task.current_state == TaskState.DONE,
-                        )
-                    )
-                    for _t in _rows.scalars():
-                        if "frontend" in (_t.assigned_agent or "").lower():
-                            if _t.output and len(_t.output) > 50:
-                                fe_code_snippets.append(_t.output)
+                    reg = ComponentRegistry(_s)
+                    reg_entries = await reg.list_all(str(project_id))
+                    fe_code_snippets = [
+                        e.source_code for e in reg_entries
+                        if e.source_code
+                    ]
             except Exception as _e:
                 logger.warning("Could not collect FE snippets: %s", _e)
 
-            output_dir = str((Path("H:/forgeai-output") / str(project_id)).resolve())
+            output_dir = str(
+                Path(os.environ.get("FORGEAI_OUTPUT_DIR", "forgeai-output"))
+                / str(project_id)
+            )
             integration_qa = IntegrationQAOrchestrator(
                 llm_client=llm,
                 output_dir=output_dir,
