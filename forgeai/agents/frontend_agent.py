@@ -240,6 +240,26 @@ For every API call:
             raise RuntimeError("FrontendAgent requires llm_client, component_registry, and agent_memory")
         result = await self.db.execute(select(Task).where(Task.id == task_id))
         task = result.scalar_one()
+        if loop_count > 0 and self.task_memory is not None:
+            try:
+                import json as _json
+
+                defect_json = await self.task_memory.get(
+                    str(task_id), "defect_report"
+                )
+                if defect_json:
+                    defect = _json.loads(defect_json)
+                    task_description = (
+                        "PREVIOUS ATTEMPT FAILED — fix these issues:\n"
+                        f"Summary: {defect.get('failure_summary', '')}\n\n"
+                        f"Required fixes:\n{defect.get('suggestions', '')}\n\n"
+                        "Failed tests:\n"
+                        + "\n".join(defect.get("failed_tests", []))
+                        + "\n\nOriginal task:\n"
+                        + (task_description or "")
+                    )
+            except Exception:
+                pass
         project_id = str(task.project_id)
         existing: list[str] = []
         if self.nav_contract:
@@ -260,27 +280,6 @@ For every API call:
         )
         lesson_lines = [f"- {x.lesson.rule}" for x in ranked[:5]]
         lessons_block = "\n".join(lesson_lines) if lesson_lines else "(no prior lessons)"
-
-        if loop_count > 0 and self.task_memory is not None:
-            try:
-                defect_json = await self.task_memory.get(
-                    str(task_id), "defect_report"
-                )
-                if defect_json:
-                    import json as _json
-
-                    defect = _json.loads(defect_json)
-                    defect_block = (
-                        "PREVIOUS ATTEMPT FAILED. Fix these specific issues:\n"
-                        f"Summary: {defect.get('failure_summary', '')}\n\n"
-                        f"Required fixes:\n{defect.get('suggestions', '')}\n\n"
-                        "Failed tests:\n"
-                        + "\n".join(defect.get("failed_tests", []))
-                        + "\n\nOriginal task:\n"
-                    )
-                    task_description = defect_block + (task_description or "")
-            except Exception:
-                pass
 
         nav_block = self.nav_contract.model_dump_json() if self.nav_contract else "{}"
         user_message = (

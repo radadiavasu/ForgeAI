@@ -73,12 +73,16 @@ class FrontendSandbox:
 
             await self._write_file(container, "/sandbox/src/App.jsx", component_code)
             if component_registry:
-                for name, code in component_registry.items():
-                    await self._write_file(
-                        container,
-                        f"/sandbox/src/{name}.jsx",
-                        code,
-                    )
+                for comp_name, comp_code in component_registry.items():
+                    if comp_code and comp_name:
+                        await self._write_file(
+                            container,
+                            f"/sandbox/src/{comp_name}.jsx",
+                            comp_code,
+                        )
+                        logger.info(
+                            "[FRONTEND SANDBOX] Injected component: %s", comp_name
+                        )
             logger.info("[FRONTEND SANDBOX] Writing React component...")
             await self._write_entry_files(container)
             await self._write_file(container, "/sandbox/tests/app.spec.js", test_code)

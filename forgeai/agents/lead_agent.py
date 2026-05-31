@@ -1610,7 +1610,7 @@ class LeadAgent(BaseAgent):
                 or (
                     "import { describe, it, expect } from 'vitest';\n"
                     "describe('UI', () => {\n"
-                    "  it('renders', () => {\n"
+                    "  it('renders without error', () => {\n"
                     "    expect(true).toBe(true);\n"
                     "  });\n"
                     "});\n"
