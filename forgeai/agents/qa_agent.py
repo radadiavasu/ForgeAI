@@ -162,6 +162,32 @@ class QAAgent(BaseAgent):
         """Run sandbox tests after enforcing no self-approval."""
         await self._assert_not_self_approval(task_id)
         if development_phase == "FRONTEND_PHASE":
+            # Route to Vitest if test_code is Vitest syntax
+            test_is_vitest = (
+                "from 'vitest'" in (test_code or "")
+                or 'from "vitest"' in (test_code or "")
+                or (
+                    "describe(" in (test_code or "")
+                    and "import" in (test_code or "")
+                    and "@playwright" not in (test_code or "")
+                )
+            )
+            if test_is_vitest and self.test_runner is not None:
+                res_t = await self.db.execute(
+                    select(Task).where(Task.id == task_id)
+                )
+                task_obj = res_t.scalar_one_or_none()
+                if task_obj is not None:
+                    ts = await load_tech_stack_document(
+                        self.db, task_obj.project_id
+                    )
+                    if ts and "vitest" in ts.testing_framework.lower():
+                        try:
+                            return await self.test_runner.sandbox.run_vitest(
+                                code, test_code
+                            )
+                        except Exception:
+                            pass
             return await self._run_playwright(
                 code, test_code, component_registry=component_registry
             )

@@ -228,11 +228,32 @@ class BackendAgent(BaseAgent):
         tech_stack = await load_tech_stack_document(self.db, task.project_id)
         task_title_lower = (task.title or "").lower()
         is_dockerfile_task = "dockerfile" in task_title_lower
+        is_sql_task = (
+            "migration" in task_title_lower
+            or "001_init" in task_title_lower
+            or task_title_lower.endswith(".sql")
+        )
+        is_yaml_task = "docker compose" in task_title_lower
         system_prompt = f"{BACKEND_ROLE_PROMPT}\n\nRelevant past lessons:\n{lessons_block}"
         if is_dockerfile_task:
             system_prompt += (
-                "\n\nOutput ONLY the Dockerfile content. No JavaScript code. "
-                "No JSON. No markdown. Raw Dockerfile syntax only. Start with FROM."
+                "\n\nOutput ONLY the Dockerfile content. "
+                "No JavaScript. No JSON. No markdown. "
+                "Raw Dockerfile syntax only. Start with FROM."
+            )
+        elif is_sql_task:
+            system_prompt += (
+                "\n\nOutput ONLY raw SQL. No JavaScript. No JSON. "
+                "No markdown. No explanations. "
+                "Start with -- SQL or CREATE TABLE directly."
+            )
+        elif is_yaml_task:
+            system_prompt += (
+                "\n\nOutput ONLY valid YAML for docker-compose.yml. "
+                "No JavaScript. No JSON wrapping. "
+                "Start with 'version:' or 'services:'. "
+                "Use Dockerfile.backend for the backend service. "
+                "Use Dockerfile.frontend for the frontend service."
             )
         elif tech_stack:
             system_prompt += (
@@ -261,8 +282,23 @@ class BackendAgent(BaseAgent):
         )
         if is_dockerfile_task:
             user_message += (
-                "\n\nOutput ONLY the Dockerfile content. No JavaScript code. "
-                "No JSON. No markdown. Raw Dockerfile syntax only. Start with FROM."
+                "\n\nOutput ONLY the Dockerfile content. "
+                "No JavaScript. No JSON. No markdown. "
+                "Raw Dockerfile syntax only. Start with FROM."
+            )
+        elif is_sql_task:
+            user_message += (
+                "\n\nOutput ONLY raw SQL. No JavaScript. No JSON. "
+                "No markdown. No explanations. "
+                "Start with -- SQL or CREATE TABLE directly."
+            )
+        elif is_yaml_task:
+            user_message += (
+                "\n\nOutput ONLY valid YAML for docker-compose.yml. "
+                "No JavaScript. No JSON wrapping. "
+                "Start with 'version:' or 'services:'. "
+                "Use Dockerfile.backend for the backend service. "
+                "Use Dockerfile.frontend for the frontend service."
             )
 
         logger.info(

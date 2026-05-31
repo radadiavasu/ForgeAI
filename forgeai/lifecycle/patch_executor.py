@@ -123,15 +123,38 @@ class PatchExecutor:
 
         machine = TaskStateMachine(self.db, task_memory=self.lead.task_memory)
         await machine.transition(task.id, TaskState.IN_PROGRESS, task.assigned_agent)
-        backend = BackendAgent(
-            task.assigned_agent,
-            self.db,
-            task_memory=self.lead.task_memory,
-        )
-        await backend.complete_work(
-            task.id,
-            output=f"# PATCH fix for: {change_request[:200]}\ndef patched():\n    return True\n",
-        )
+
+        if (
+            hasattr(self.lead, "_llm_client")
+            and self.lead._llm_client is not None
+            and hasattr(self.lead, "_agent_memory")
+            and self.lead._agent_memory is not None
+        ):
+            backend = BackendAgent(
+                task.assigned_agent,
+                self.db,
+                task_memory=self.lead.task_memory,
+                llm_client=self.lead._llm_client,
+                agent_memory=self.lead._agent_memory,
+            )
+            await backend.complete_work(
+                task.id,
+                task_description=(
+                    f"PATCH: {change_request}\n\n"
+                    "Fix the existing implementation to address "
+                    "this change request. Return only the corrected code."
+                ),
+                master_document_section=change_request,
+                loop_count=0,
+            )
+        else:
+            await machine.transition(
+                task.id,
+                TaskState.IN_REVIEW,
+                task.assigned_agent,
+                **{KEY_WORK_OUTPUT: f"# PATCH applied: {change_request[:200]}\n"},
+            )
+
         await machine.transition(task.id, TaskState.TESTING, "qa_agent_1")
         await machine.transition(
             task.id,

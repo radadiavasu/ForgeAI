@@ -234,10 +234,18 @@ class PackageAssembler:
                 [rel_path],
             )
 
-        compose = await self._generate_docker_compose(tech_stack, str(root))
         compose_path = root / "docker-compose.yml"
-        compose_path.write_text(compose, encoding="utf-8")
-        print("[DELIVERY] Generating docker-compose.yml...")
+        if compose_path.exists() and compose_path.stat().st_size > 200:
+            logger.info(
+                "docker-compose.yml already exists from task (%d bytes) — skipping regeneration",
+                compose_path.stat().st_size,
+            )
+            print("[DELIVERY] docker-compose.yml from task — skipping regeneration")
+            compose = compose_path.read_text(encoding="utf-8")
+        else:
+            compose = await self._generate_docker_compose(tech_stack, str(root))
+            compose_path.write_text(compose, encoding="utf-8")
+            print("[DELIVERY] Generating docker-compose.yml...")
         files_written.append("docker-compose.yml")
         total_bytes += compose_path.stat().st_size
         self.git.commit("compose", "forgeai", "deployment", ["docker-compose.yml"])
@@ -478,10 +486,28 @@ class PackageAssembler:
             has_frontend = self._has_frontend_artifacts(root)
         if has_backend is None:
             has_backend = self._has_backend_artifacts(root)
+
+        lang = tech_stack.language.lower()
+        is_js = "javascript" in lang or "typescript" in lang
+
+        # Check if task-generated Dockerfiles exist
+        dockerfile_backend = root / "Dockerfile.backend"
+        dockerfile_frontend = root / "Dockerfile.frontend"
+        _ = dockerfile_frontend
+
+        if dockerfile_backend.exists() and dockerfile_backend.stat().st_size > 50:
+            if is_js:
+                return self._dockerfile_node_express(tech_stack)
+            return self._dockerfile_python_only(tech_stack)
+
         if has_frontend and has_backend:
+            if is_js:
+                return self._dockerfile_node_express(tech_stack)
             return self._dockerfile_react_python(tech_stack)
         if has_frontend:
             return self._dockerfile_react_only(tech_stack)
+        if is_js:
+            return self._dockerfile_node_express(tech_stack)
         return self._dockerfile_python_only(tech_stack)
 
     async def _generate_docker_compose(
@@ -503,14 +529,25 @@ class PackageAssembler:
         return content
 
     def _generate_env_example(self, tech_stack: TechStackDocument) -> str:
-        lines = [
-            "# Copy to .env and fill in values",
-            "DATABASE_URL=postgresql://user:password@db:5432/app  # Primary database",
-            "SECRET_KEY=change-me  # Session signing key",
-            "API_PORT=8000  # Backend port",
-        ]
-        if "react" in tech_stack.framework.lower():
-            lines.append("VITE_API_URL=http://localhost:8000  # Frontend API base URL")
+        lang = tech_stack.language.lower()
+        is_js = "javascript" in lang or "typescript" in lang
+
+        if is_js:
+            lines = [
+                "# Copy to .env and fill in values",
+                "DATABASE_URL=postgresql://user:password@db:5432/app",
+                "PORT=3001",
+                "NODE_ENV=production",
+            ]
+            if "react" in " ".join(tech_stack.libraries).lower():
+                lines.append("VITE_API_URL=http://localhost:3001")
+        else:
+            lines = [
+                "# Copy to .env and fill in values",
+                "DATABASE_URL=postgresql://user:password@db:5432/app",
+                "SECRET_KEY=change-me",
+                "API_PORT=8000",
+            ]
         return "\n".join(lines) + "\n"
 
     async def _validate_docker_build(self, output_dir: str, project_id: str) -> bool:
@@ -639,7 +676,25 @@ class PackageAssembler:
         lower = text.strip().lower()
         if lower in _QA_PLACEHOLDER_OUTPUTS:
             return True
-        return lower.endswith(" ok") and len(lower) < 80
+        if lower.endswith(" ok") and len(lower) < 80:
+            return True
+        # Detect agent commentary/thinking instead of code
+        _COMMENTARY_PHRASES = (
+            "wait, let me",
+            "let me reconsider",
+            "let me provide",
+            "let me structure",
+            "now let me",
+            "actually, let me",
+            "i need to reconsider",
+            "let me think",
+            "upon reflection",
+            "looking at this again",
+            "i should clarify",
+        )
+        if any(lower.startswith(p) or p in lower[:200] for p in _COMMENTARY_PHRASES):
+            return True
+        return False
 
     def _is_forgeai_pipeline_source(self, content: str) -> bool:
         """True when content looks like ForgeAI's own main.py / pipeline, not agent output."""
@@ -686,7 +741,12 @@ class PackageAssembler:
 
     def _has_backend_artifacts(self, root: Path) -> bool:
         api_dir = root / "src" / "api"
-        return any(api_dir.glob("*.py"))
+        server = root / "src" / "server.js"
+        return (
+            any(api_dir.glob("*.py"))
+            or any(api_dir.glob("*.js"))
+            or server.exists()
+        )
 
     def _write_requirements_txt(
         self,
@@ -694,6 +754,10 @@ class PackageAssembler:
         tech_stack: TechStackDocument,
         has_backend: bool,
     ) -> None:
+        lang = tech_stack.language.lower()
+        is_js = "javascript" in lang or "typescript" in lang
+        if is_js:
+            return
         if not has_backend:
             return
         lines = [
@@ -704,6 +768,18 @@ class PackageAssembler:
         if "postgres" in tech_stack.database.lower():
             lines.append("psycopg2-binary>=2.9.9")
         (root / "requirements.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _dockerfile_node_express(self, tech_stack: TechStackDocument) -> str:
+        _ = tech_stack
+        return """\
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm install --omit=dev 2>/dev/null || npm install
+COPY src/ ./src/
+EXPOSE 3001
+CMD ["node", "src/server.js"]
+"""
 
     def _dockerfile_python_only(self, tech_stack: TechStackDocument) -> str:
         _ = tech_stack
